@@ -1,6 +1,6 @@
 {
   "name": "pudureport",
-  "version": "0.0.24",
+  "version": "0.0.25",
   "description": "Editor local-first de reportes de pentest con generacion de PDF via Typst",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -25,6 +25,10 @@
     "@tiptap/extension-image": "^2.27.2",
     "@tiptap/extension-link": "^2.27.2",
     "@tiptap/extension-placeholder": "^2.10.3",
+    "@tiptap/extension-table": "^2.27.3",
+    "@tiptap/extension-table-cell": "^2.27.3",
+    "@tiptap/extension-table-header": "^2.27.3",
+    "@tiptap/extension-table-row": "^2.27.3",
     "@tiptap/pm": "^2.10.3",
     "@tiptap/react": "^2.10.3",
     "@tiptap/starter-kit": "^2.10.3",

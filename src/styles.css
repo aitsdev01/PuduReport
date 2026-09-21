@@ -845,6 +845,28 @@ i.ti {
 .ProseMirror p {
   margin: 0.4em 0;
 }
+/* Tablas dentro del editor visual (nodos de @tiptap/extension-table). */
+.ProseMirror table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+  margin: 0.6em 0;
+}
+.ProseMirror th,
+.ProseMirror td {
+  border: 1px solid var(--border);
+  padding: 6px 9px;
+  vertical-align: top;
+  text-align: left;
+}
+.ProseMirror th {
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+.ProseMirror .selectedCell {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 /* Bloque de codigo: siempre oscuro, con resaltado de sintaxis (lowlight). */
 .ProseMirror pre {
   background: #1e1f24;

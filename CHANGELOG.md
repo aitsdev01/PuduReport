@@ -2,6 +2,19 @@
 
 Todo cambio notable se documenta en este archivo. El formato sigue Keep a Changelog (https://keepachangelog.com) y el versionado sigue SemVer (https://semver.org).
 
+## [0.0.25] - 2026-09-21
+
+### Added
+- Pegar (Ctrl/Cmd+V), arrastrar y el boton Adjuntar evidencia insertan imagenes en las dos vistas del editor, no solo en la visual; en la vista Markdown la referencia se inserta en la posicion del cursor.
+- Vista visual disponible en todas las casillas (Descripcion, Impacto, Prueba de concepto, Remediacion y secciones de prosa), incluidas las que tienen tablas, gracias a soporte de tablas en el editor. Boton para insertar/eliminar tabla en la barra visual.
+
+### Fixed
+- En la vista Markdown pegar o soltar una imagen no hacia nada: el manejo de imagenes solo estaba en el editor visual. Ahora funciona en ambas vistas. Tambien se cubren las capturas que el portapapeles entrega por `items` en vez de `files`.
+- Las casillas con tablas ya no quedan bloqueadas en Markdown sin forma de insertar evidencias ni de ver el render.
+
+### Compatibility
+- Se conservan Markdown/YAML, plantillas y formatos persistidos. Las tablas GFM sobreviven el ida y vuelta Markdown/Visual (celdas de una linea, el caso tipico de un reporte) y se siguen renderizando en el PDF.
+
 ## [0.0.24] - 2026-09-18
 
 ### Added

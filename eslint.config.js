@@ -41,6 +41,7 @@ export default [
         FileReader: "readonly",
         Blob: "readonly",
         DragEvent: "readonly",
+        DataTransfer: "readonly",
         MouseEvent: "readonly",
         KeyboardEvent: "readonly",
         HTMLDialogElement: "readonly",

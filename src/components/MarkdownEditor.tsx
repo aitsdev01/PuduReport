@@ -7,6 +7,10 @@ import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
+import Table from "@tiptap/extension-table";
+import TableRow from "@tiptap/extension-table-row";
+import TableHeader from "@tiptap/extension-table-header";
+import TableCell from "@tiptap/extension-table-cell";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
 import { createLowlight } from "lowlight";
 import bash from "highlight.js/lib/languages/bash";
@@ -116,20 +120,29 @@ function readBase64(file: File): Promise<string> {
   });
 }
 
+/** Extrae archivos de un ClipboardData/DataTransfer, con respaldo en `items`:
+ * algunas capturas de pantalla llegan por `items` (kind "file") y no por
+ * `files`. Para texto plano no hay items "file", asi que devuelve [] y el
+ * pegado normal de texto sigue funcionando. */
+function filesFrom(dt: DataTransfer | null | undefined): File[] {
+  if (!dt) return [];
+  const out = Array.from(dt.files ?? []);
+  if (out.length === 0 && dt.items) {
+    for (const it of Array.from(dt.items)) {
+      if (it.kind === "file") {
+        const f = it.getAsFile();
+        if (f) out.push(f);
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Editor Markdown con fuente por defecto y vista visual opcional (TipTap).
  * Si recibe assetBase + projectId, permite pegar o soltar evidencias: las
  * imagenes se guardan en assets/ con nombre UUID y quedan como ![](assets/...).
  */
-// TipTap actual no tiene nodos de tabla. Mantener la fuente evita perder celdas.
-function hasMarkdownTable(value: string): boolean {
-  return value
-    .split("\n")
-    .some(
-      (line) => line.includes("|") && /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/.test(line),
-    );
-}
-
 export function MarkdownEditor({ value, onChange, placeholder, assetBase, projectId }: Props) {
   const editorRef = useRef<Editor | null>(null);
   // Vista activa: "source" muestra el markdown crudo en un textarea; "rich" el
@@ -184,6 +197,30 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
     }
   }
 
+  // Espejo de insertFile para la vista markdown: guarda el asset e inserta su
+  // referencia markdown (![](assets/..) para imagenes, [nombre](..) para otros)
+  // en la posicion del cursor del textarea. Asi pegar/soltar/adjuntar funciona
+  // igual en ambas vistas, no solo en el editor visual.
+  async function insertIntoSource(file: File) {
+    if (!projectId) return;
+    try {
+      const base64 = await readBase64(file);
+      const rel = await api.saveAsset(projectId, extFromFile(file), base64);
+      const md = file.type.startsWith("image/") ? `![](${rel})` : `[${file.name}](${rel})`;
+      const input = sourceRef.current;
+      const start = input?.selectionStart ?? source.length;
+      const end = input?.selectionEnd ?? source.length;
+      const next = `${source.slice(0, start)}\n\n${md}\n\n${source.slice(end)}`.replace(
+        /\n{3,}/g,
+        "\n\n",
+      );
+      setSource(next);
+      onChange(next);
+    } catch (err) {
+      console.error("No se pudo adjuntar el archivo:", err);
+    }
+  }
+
   // Abre el editor de anotaciones sobre la imagen seleccionada en el editor.
   function annotateSelectedImage() {
     const editor = editorRef.current;
@@ -228,21 +265,28 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
       Placeholder.configure({ placeholder: placeholder ?? "Escribe aqui..." }),
       AssetImage.configure({ inline: false }),
       Link.configure({ openOnClick: false, autolink: false }),
+      // Tablas: TipTap no las trae en StarterKit. Con estos nodos, tiptap-markdown
+      // serializa/parsea tablas GFM, asi que sobreviven el ida-y-vuelta
+      // markdown<->visual y "Vista" queda disponible en todas las casillas.
+      Table.configure({ resizable: false }),
+      TableRow,
+      TableHeader,
+      TableCell,
     ],
     editorProps: {
       handlePaste(_view, event) {
-        const files = event.clipboardData?.files;
-        if (uploadEnabled && files && files.length > 0) {
-          Array.from(files).forEach((f) => void insertFile(f));
+        const files = filesFrom(event.clipboardData);
+        if (uploadEnabled && files.length > 0) {
+          files.forEach((f) => void insertFile(f));
           return true;
         }
         return false;
       },
       handleDrop(_view, event) {
-        const dt = (event as DragEvent).dataTransfer;
-        if (uploadEnabled && dt?.files && dt.files.length > 0) {
+        const files = filesFrom((event as DragEvent).dataTransfer);
+        if (uploadEnabled && files.length > 0) {
           event.preventDefault();
-          Array.from(dt.files).forEach((f) => void insertFile(f));
+          files.forEach((f) => void insertFile(f));
           return true;
         }
         return false;
@@ -262,7 +306,7 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
 
   // Alterna vista sincronizando el contenido entre el textarea y el editor.
   function applyMode(next: "source" | "rich") {
-    if (next === mode || !editor || (next === "rich" && hasMarkdownTable(source))) return;
+    if (next === mode || !editor) return;
     if (next === "source") {
       setSource(normalizeImages(editor.storage.markdown.getMarkdown()));
     } else {
@@ -277,9 +321,8 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
         editor={editor}
         mode={mode}
         onSetMode={applyMode}
-        sourceOnly={mode === "source" && hasMarkdownTable(source)}
         uploadEnabled={uploadEnabled}
-        onPickFile={insertFile}
+        onPickFile={mode === "source" ? insertIntoSource : insertFile}
         onAnnotate={annotateSelectedImage}
         onSourceFormat={applySourceFormat}
       />
@@ -289,6 +332,22 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
           className="md-source"
           value={source}
           placeholder={placeholder ?? "Escribe aqui..."}
+          onPaste={(e) => {
+            if (!uploadEnabled) return;
+            const files = filesFrom(e.clipboardData);
+            if (files.length > 0) {
+              e.preventDefault();
+              files.forEach((f) => void insertIntoSource(f));
+            }
+          }}
+          onDrop={(e) => {
+            if (!uploadEnabled) return;
+            const files = filesFrom(e.dataTransfer);
+            if (files.length > 0) {
+              e.preventDefault();
+              files.forEach((f) => void insertIntoSource(f));
+            }
+          }}
           onKeyDown={(e) => {
             if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.nativeEvent.isComposing)
               return;
@@ -323,7 +382,6 @@ function Toolbar({
   editor,
   mode,
   onSetMode,
-  sourceOnly,
   uploadEnabled,
   onPickFile,
   onAnnotate,
@@ -332,7 +390,6 @@ function Toolbar({
   editor: Editor;
   mode: "source" | "rich";
   onSetMode: (mode: "source" | "rich") => void;
-  sourceOnly: boolean;
   uploadEnabled: boolean;
   onPickFile: (file: File) => void;
   onAnnotate: () => void;
@@ -384,19 +441,37 @@ function Toolbar({
             <i className={`ti ${icon}`} aria-hidden="true" />
           </button>
         ))}
-        {!sourceOnly &&
-          btn(
-            <>
-              <i className="ti ti-eye" /> Vista
-            </>,
-            false,
-            () => onSetMode("rich"),
-            "Ver renderizado",
-          )}
-        {sourceOnly && (
-          <span className="faint" role="status">
-            Tabla: revisa el resultado en Vista previa.
-          </span>
+        {uploadEnabled && (
+          <>
+            <button
+              type="button"
+              title="Adjuntar evidencia (imagen o archivo)"
+              aria-label="Adjuntar evidencia"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => fileRef.current?.click()}
+            >
+              <i className="ti ti-photo-plus" aria-hidden="true" />
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) onPickFile(file);
+                e.target.value = "";
+              }}
+            />
+          </>
+        )}
+        {btn(
+          <>
+            <i className="ti ti-eye" /> Vista
+          </>,
+          false,
+          () => onSetMode("rich"),
+          "Ver renderizado",
         )}
       </div>
     );
@@ -473,6 +548,19 @@ function Toolbar({
           false,
           () => editor.chain().focus().setHorizontalRule().run(),
           "Linea divisoria",
+        )}
+        {btn(
+          <i className="ti ti-table" />,
+          editor.isActive("table"),
+          () =>
+            editor.isActive("table")
+              ? editor.chain().focus().deleteTable().run()
+              : editor
+                  .chain()
+                  .focus()
+                  .insertTable({ rows: 3, cols: 3, withHeaderRow: true })
+                  .run(),
+          editor.isActive("table") ? "Eliminar tabla" : "Insertar tabla",
         )}
         {btn(
           <i className="ti ti-link" />,
