@@ -117,6 +117,40 @@ pub struct Conflict {
     pub campo: Option<String>,
 }
 
+/// Estado de un informe segun `GET /{id}` (solo lo que usa la apertura).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InformeState {
+    /// Revision vigente del borrador (para `POST /{id}/versiones`).
+    pub revision: u64,
+    /// Ultima version inmutable (0 si todavia no tiene).
+    pub version_actual: u64,
+}
+
+/// Cabeceras de version de `GET /{id}/paquete`.
+pub const VERSION_HEADER: &str = "X-Informe-Version";
+pub const PENDING_DRAFT_HEADER: &str = "X-Informe-Borrador-Pendiente";
+
+/// Respuesta de `GET /{id}/paquete` con las cabeceras ya leidas y el cuerpo
+/// todavia sin descargar: si el borrador tiene cambios pendientes, la apertura
+/// la descarta sin leerla y pide la version nueva.
+#[derive(Debug)]
+pub struct PackageDownload {
+    response: Response,
+    cap: u64,
+    /// Version que se entrega (`X-Informe-Version`), si PuduHub la informa.
+    pub version: Option<u64>,
+    /// `X-Informe-Borrador-Pendiente: 1`: el borrador cambio despues de esta
+    /// version (cambios de la web que el paquete no incluye).
+    pub borrador_pendiente: bool,
+}
+
+impl PackageDownload {
+    /// Descarga el cuerpo, cortando en el tope de paquete.
+    pub async fn bytes(self) -> Result<Vec<u8>, HubError> {
+        read_capped(self.response, self.cap).await
+    }
+}
+
 /// Resultado de `POST /{id}/sincronizar`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncResponse {
@@ -258,9 +292,55 @@ impl HubClient {
         parse_item(&value).ok_or_else(invalid_response)
     }
 
-    /// `GET /{id}/paquete[?version=N]`: el `.pudupkg` de una version (sin
-    /// `version`, PuduHub entrega el borrador como punto de control).
-    pub async fn package(&self, id: &str, version: Option<u64>) -> Result<Vec<u8>, HubError> {
+    /// `GET /{id}`: revision del borrador y ultima version.
+    pub async fn state(&self, id: &str) -> Result<InformeState, HubError> {
+        let id = checked_id(id)?;
+        let value = self
+            .json(self.request(Method::GET, &format!("/{id}"), self.limits.json_timeout))
+            .await?;
+        let item = parse_item(&value).ok_or_else(invalid_response)?;
+        let revision = positive(value.get("revision"), u64::MAX).ok_or_else(invalid_response)?;
+        if !item.id.eq_ignore_ascii_case(id) {
+            return Err(invalid_response());
+        }
+        Ok(InformeState {
+            revision,
+            version_actual: item.version_actual,
+        })
+    }
+
+    /// `POST /{id}/versiones` `{motivo, revision}` con el token del bloqueo:
+    /// guarda el borrador como version (punto de control) y devuelve su numero.
+    pub async fn create_version(
+        &self,
+        id: &str,
+        lock: &str,
+        motivo: &str,
+        revision: u64,
+    ) -> Result<u64, HubError> {
+        let id = checked_id(id)?;
+        let value = self
+            .json(
+                self.request(
+                    Method::POST,
+                    &format!("/{id}/versiones"),
+                    self.limits.json_timeout,
+                )
+                .header(LOCK_HEADER, lock)
+                .json(&serde_json::json!({ "motivo": motivo, "revision": revision })),
+            )
+            .await?;
+        positive(value.get("version"), MAX_VERSION).ok_or_else(invalid_response)
+    }
+
+    /// `GET /{id}/paquete[?version=N]`: el `.pudupkg` de una version existente
+    /// (sin `version`, la ultima). Solo lectura: nunca crea versiones; sin
+    /// ninguna, PuduHub responde `409 version_required`.
+    pub async fn package(
+        &self,
+        id: &str,
+        version: Option<u64>,
+    ) -> Result<PackageDownload, HubError> {
         let id = checked_id(id)?;
         let mut request = self
             .request(
@@ -276,8 +356,8 @@ impl HubClient {
             request = request.query(&[("version", version.to_string())]);
         }
         let response = self.send(request).await?;
-        let content_type = response
-            .headers()
+        let headers = response.headers();
+        let content_type = headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
@@ -289,7 +369,37 @@ impl HubClient {
         if content_type != "application/zip" && content_type != "application/octet-stream" {
             return Err(invalid_response());
         }
-        read_capped(response, self.limits.package_bytes).await
+        let served = match headers.get(VERSION_HEADER) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| (1..=MAX_VERSION).contains(v))
+                    .ok_or_else(invalid_response)?,
+            ),
+        };
+        if version.is_some_and(|v| served.is_some_and(|s| s != v)) {
+            return Err(invalid_response());
+        }
+        let borrador_pendiente = match headers.get(PENDING_DRAFT_HEADER).map(|v| v.as_bytes()) {
+            None | Some(b"0") => false,
+            Some(b"1") => true,
+            Some(_) => return Err(invalid_response()),
+        };
+        if response
+            .content_length()
+            .is_some_and(|len| len > self.limits.package_bytes)
+        {
+            return Err(too_large_response());
+        }
+        Ok(PackageDownload {
+            response,
+            cap: self.limits.package_bytes,
+            version: served,
+            borrador_pendiente,
+        })
     }
 
     /// `POST /{id}/bloqueo` `{forzar}`: toma el bloqueo de edicion y devuelve
@@ -632,6 +742,10 @@ pub(crate) fn map_status(status: u16, body: &[u8]) -> HubError {
             error.extra.conflictos = parse_conflicts(&parsed);
             error
         }
+        (409, "version_required") => HubError::new(
+            "sin_version",
+            "El informe todavia no tiene ninguna version en PuduHub y no se pudo crear una porque otra persona lo esta editando. Vuelva a intentarlo cuando se libere el bloqueo.",
+        ),
         (409, "unknown_base_version") => HubError::new(
             "version_base_desconocida",
             "PuduHub no reconoce la version de la que partio este proyecto. Descargue la version del servidor.",

@@ -56,6 +56,8 @@ export interface PuduHubOpenResult {
   nombre: string;
   version: number;
   actualizado: boolean;
+  /** Por ejemplo, cambios de la web que no venian en la version descargada. */
+  aviso: string | null;
 }
 
 export interface PuduHubLinkStatus {
@@ -94,6 +96,7 @@ export interface PuduHubDownloadResult {
   proyectoId: string;
   respaldoId: string | null;
   version: number;
+  aviso: string | null;
 }
 
 export type PuduHubEntity = "proyecto" | "seccion" | "hallazgo" | "orden" | "asset";

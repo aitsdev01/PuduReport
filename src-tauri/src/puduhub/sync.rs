@@ -74,6 +74,8 @@ pub struct OpenResult {
     pub version: u64,
     /// true si se actualizo una copia local existente.
     pub actualizado: bool,
+    /// Por ejemplo, cambios de la web que no venian en la version descargada.
+    pub aviso: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -99,6 +101,7 @@ pub struct DownloadResult {
     /// Copia del proyecto local antes de reemplazarlo.
     pub respaldo_id: Option<String>,
     pub version: u64,
+    pub aviso: Option<String>,
 }
 
 fn not_linked() -> HubError {
@@ -254,6 +257,96 @@ fn validate_download(
     Ok((validated, version))
 }
 
+/// Motivo de la version que se crea al abrir un informe con cambios sin
+/// version en PuduHub.
+pub const OPEN_REASON: &str = "Apertura desde PuduReport escritorio";
+
+/// Ultima version de un informe, validada.
+struct Fetched {
+    validated: ValidatedPackage,
+    version: u64,
+    aviso: Option<String>,
+}
+
+/// Descarga y valida una version: `version` si se indica, si no la ultima.
+async fn download(
+    client: &HubClient,
+    informe_id: &str,
+    version: Option<u64>,
+) -> Result<(ValidatedPackage, u64, bool), HubError> {
+    let response = client.package(informe_id, version).await?;
+    let pending = response.borrador_pendiente;
+    let expected = version.or(response.version);
+    let bytes = response.bytes().await?;
+    let (validated, version) = validate_download(&bytes, informe_id, expected)?;
+    Ok((validated, version, pending))
+}
+
+/// Trae la ultima version del informe incluyendo los cambios de la web.
+///
+/// `GET /{id}/paquete` es de solo lectura: entrega versiones existentes. Si el
+/// informe no tiene ninguna, o el borrador cambio despues de la ultima
+/// (`X-Informe-Borrador-Pendiente: 1`), se toma el bloqueo, se crea un punto de
+/// control con `POST /{id}/versiones` y se baja esa version. El bloqueo se
+/// libera siempre al terminar (la edicion sigue en el escritorio, sin
+/// conexion). Si otra persona tiene el bloqueo, se baja la ultima version tal
+/// cual y se avisa si quedaron cambios de la web fuera.
+async fn fetch_latest(client: &HubClient, informe_id: &str) -> Result<Fetched, HubError> {
+    let lock = match client.lock(informe_id, false).await {
+        Ok(lock) => lock,
+        Err(e) if e.codigo == "bloqueo_tomado" => {
+            let (validated, version, pending) = download(client, informe_id, None).await?;
+            let aviso = pending.then(|| {
+                format!(
+                    "Se descargo la version {version}, pero el informe tiene cambios en PuduHub que aun no son una version y no se incluyeron: otra persona lo esta editando. Actualice cuando se libere el bloqueo."
+                )
+            });
+            return Ok(Fetched {
+                validated,
+                version,
+                aviso,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let result = fetch_with_lock(client, informe_id, &lock).await;
+    // El bloqueo se libera siempre; si falla, vence solo.
+    let _ = client.unlock(informe_id, &lock).await;
+    result
+}
+
+async fn fetch_with_lock(
+    client: &HubClient,
+    informe_id: &str,
+    lock: &str,
+) -> Result<Fetched, HubError> {
+    // Con el bloqueo tomado nadie mas escribe: la revision no cambia.
+    let state = client.state(informe_id).await?;
+    if state.version_actual > 0 {
+        let response = client.package(informe_id, None).await?;
+        if !response.borrador_pendiente {
+            let expected = response.version;
+            let bytes = response.bytes().await?;
+            let (validated, version) = validate_download(&bytes, informe_id, expected)?;
+            return Ok(Fetched {
+                validated,
+                version,
+                aviso: None,
+            });
+        }
+        // Hay cambios sin version: esta respuesta se descarta sin leerla.
+    }
+    let version = client
+        .create_version(informe_id, lock, OPEN_REASON, state.revision)
+        .await?;
+    let (validated, version, _) = download(client, informe_id, Some(version)).await?;
+    Ok(Fetched {
+        validated,
+        version,
+        aviso: None,
+    })
+}
+
 /// Marca de tiempo compacta para nombres de respaldo (`20261025-101500`).
 fn stamp() -> String {
     workspace::now_utc_iso()
@@ -328,7 +421,8 @@ fn new_link(servidor: &str, informe_id: &str, version: u64, huella: String) -> L
     }
 }
 
-/// Descarga la ultima version de un informe y la abre como proyecto local.
+/// Descarga la ultima version de un informe (con los cambios de la web, ver
+/// [`fetch_latest`]) y la abre como proyecto local.
 /// Si ya hay una copia vinculada, la actualiza solo si no tiene cambios sin
 /// enviar.
 pub async fn open_informe(
@@ -347,8 +441,11 @@ pub async fn open_informe(
             return Err(error);
         }
     }
-    let bytes = client.package(informe_id, None).await?;
-    let (validated, version) = validate_download(&bytes, informe_id, None)?;
+    let Fetched {
+        validated,
+        version,
+        aviso,
+    } = fetch_latest(client, informe_id).await?;
     let (project_id, actualizado) = match existing {
         Some((project_id, _)) => {
             replace_project(root, &project_id, validated, false)?;
@@ -374,6 +471,7 @@ pub async fn open_informe(
         nombre,
         version,
         actualizado,
+        aviso,
     })
 }
 
@@ -442,12 +540,9 @@ async fn send(
         omitidos: exported.skipped,
         aviso: None,
     };
-    let downloaded = match client.package(&id, Some(response.version)).await {
-        Ok(bytes) => validate_download(&bytes, &id, Some(response.version)),
-        Err(e) => Err(e),
-    };
-    let validated = match downloaded {
-        Ok((validated, _)) => validated,
+    // PuduHub no devuelve el documento fusionado: se baja la version creada.
+    let validated = match download(client, &id, Some(response.version)).await {
+        Ok((validated, _, _)) => validated,
         Err(_) => {
             // La base no avanza: el proximo envio vuelve a fusionar sin perder
             // cambios de nadie.
@@ -485,8 +580,11 @@ pub async fn download_server_version(
     project_id: &str,
 ) -> Result<DownloadResult, HubError> {
     let link = linked_for(client, root, project_id)?;
-    let bytes = client.package(&link.informe_id, None).await?;
-    let (validated, version) = validate_download(&bytes, &link.informe_id, None)?;
+    let Fetched {
+        validated,
+        version,
+        aviso,
+    } = fetch_latest(client, &link.informe_id).await?;
     let backup = replace_project(root, project_id, validated, true)?;
     let snapshot = link::snapshot(root, project_id)?;
     link::write_link(
@@ -503,10 +601,11 @@ pub async fn download_server_version(
         proyecto_id: project_id.to_string(),
         respaldo_id: backup,
         version,
+        aviso,
     })
 }
 
-/// Crea un informe nuevo en PuduHub (`POST /`), toma su primera version como
+/// Crea un informe nuevo en PuduHub (`POST /`), crea su primera version como
 /// base y envia el proyecto local con la sincronizacion normal (con la marca
 /// del workspace).
 pub async fn upload_new(
@@ -531,10 +630,10 @@ pub async fn upload_new(
         "pentest"
     };
     let created = client.create(&titulo, tipo).await?;
-    // Sin version, PuduHub entrega el borrador recien creado como version 1:
-    // es la base de la fusion (vacia), asi que entra todo lo local.
-    let bytes = client.package(&created.id, None).await?;
-    let (_, version) = validate_download(&bytes, &created.id, None)?;
+    // El informe nuevo no tiene versiones: el punto de control del borrador
+    // recien creado es la base de la fusion (vacia), asi que entra todo lo
+    // local.
+    let Fetched { version, .. } = fetch_latest(client, &created.id).await?;
     link::write_link(
         root,
         project_id,

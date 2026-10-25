@@ -2,8 +2,9 @@
 // Copyright (c) 2026 bc0d3
 
 // Proyectos, "Abrir desde PuduHub": informes asignados al usuario. Descarga el
-// paquete de la ultima version y lo importa como proyecto local (o actualiza
-// la copia local si no tiene cambios sin enviar). Todo dato del servidor llega
+// paquete de la ultima version (Rust crea antes una version con los cambios
+// de la web si hace falta) y lo importa como proyecto local (o actualiza la
+// copia local si no tiene cambios sin enviar). Todo dato del servidor llega
 // validado desde Rust y se muestra como texto.
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../lib/api";
@@ -17,6 +18,7 @@ import {
   type PuduHubListResult,
 } from "../lib/puduhub";
 import { Modal } from "./Modal";
+import { useToast } from "./Toast";
 import "../styles/puduhub.css";
 
 interface Props {
@@ -26,6 +28,7 @@ interface Props {
 }
 
 export function PuduHubOpenDialog({ onClose, onOpened }: Props) {
+  const { notify } = useToast();
   const [query, setQuery] = useState("");
   const [submitted, setSubmitted] = useState("");
   const [page, setPage] = useState(1);
@@ -56,6 +59,7 @@ export function PuduHubOpenDialog({ onClose, onOpened }: Props) {
     setError(null);
     try {
       const opened = await api.puduhub().openInforme(informe.id);
+      if (opened.aviso) notify(opened.aviso, "info");
       onOpened(opened.proyectoId);
       onClose();
     } catch (e) {

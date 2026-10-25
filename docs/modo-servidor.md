@@ -328,8 +328,10 @@ hasta configurar la conexion.
 |---|---|
 | `GET /api/editor/informes?page=N&pageSize=20[&q=]` | Listar los informes asignados; tambien "Probar conexion" (`pageSize=10`) |
 | `POST /api/editor/informes` `{titulo, tipo}` | Subir como nuevo informe |
-| `GET /{id}/paquete[?version=N]` | Bajar el `.pudupkg` (sin `version`: el borrador como punto de control) |
-| `POST /{id}/bloqueo` `{forzar}` | Tomar el bloqueo antes de sincronizar (devuelve el token del bloqueo) |
+| `GET /{id}` | Revision del borrador y ultima version (`revision`, `versionActual`) al abrir |
+| `GET /{id}/paquete[?version=N]` | Bajar el `.pudupkg` de una version existente (sin `version`: la ultima). Solo lectura; cabeceras `X-Informe-Version` y `X-Informe-Borrador-Pendiente: 0\|1`; `409 version_required` si el informe no tiene versiones |
+| `POST /{id}/versiones` `{motivo, revision}` (`X-Lock-Token`) | Punto de control al abrir: guarda el borrador como version |
+| `POST /{id}/bloqueo` `{forzar}` | Tomar el bloqueo antes de abrir o sincronizar (devuelve el token del bloqueo) |
 | `POST /{id}/sincronizar` (paquete `application/zip`, `X-Lock-Token`) | Enviar; respuesta `{revision, version: {version, ...}}` |
 | `DELETE /{id}/bloqueo` (`X-Lock-Token`) | Liberar el bloqueo, siempre, tambien si la sincronizacion falla |
 
@@ -338,6 +340,27 @@ hasta configurar la conexion.
 1. **Abrir desde PuduHub** (Proyectos): lista titulo, tipo, estado, ultima
    version y quien tiene el bloqueo. "Descargar y abrir" baja el paquete de la
    ultima version y lo importa con el importador estricto de `package.rs`.
+   `GET /{id}/paquete` solo entrega versiones existentes, asi que los cambios
+   hechos en la web que aun no son version se incluyen con un punto de
+   control:
+   1. `POST /{id}/bloqueo` `{"forzar": false}` toma el bloqueo.
+   2. `GET /{id}` da la `revision` vigente y `versionActual`. Si
+      `versionActual` es 0, o `GET /{id}/paquete` responde
+      `X-Informe-Borrador-Pendiente: 1` (esa respuesta se descarta sin leer el
+      cuerpo), se crea una version con `POST /{id}/versiones`
+      `{"motivo": "Apertura desde PuduReport escritorio", "revision": N}` y
+      `X-Lock-Token`.
+   3. Se baja `GET /{id}/paquete?version=N`, con N de la version creada o de
+      `X-Informe-Version`; el manifiesto debe traer esa misma version.
+   4. El bloqueo se libera siempre al terminar: la edicion sigue sin conexion
+      y cada envio toma su propio bloqueo.
+
+   Si otra persona tiene el bloqueo (`lock_held`), no se crea version: se
+   baja la ultima tal cual y, si la cabecera indica cambios pendientes, se
+   avisa que los cambios de la web no se incluyeron. Si ademas el informe no
+   tiene ninguna version (`409 version_required`), se explica que hay que
+   esperar a que se libere el bloqueo.
+   "Descargar version del servidor" (conflictos) usa el mismo camino.
    Si el informe ya esta en este equipo, "Actualizar copia local" solo se
    ofrece si no tiene cambios sin enviar; si los tiene, se avisa y no se toca.
 2. **Vinculo**: `<proyecto>/.puduhub.json` con `servidor`, `informeId`,
@@ -367,12 +390,14 @@ hasta configurar la conexion.
 6. **Otros errores**: `lock_held` (quien, desde donde y hasta cuando; si es
    otra sesion del mismo usuario se ofrece "Tomar el bloqueo y enviar" con
    `forzar: true`), `lock_required`, `stale_revision`, `unknown_base_version`
-   (ofrece descargar la version del servidor), `401`, `403`, `404`, `413`,
+   (ofrece descargar la version del servidor), `version_required`, `401`,
+   `403`, `404`, `413`,
    `415`, `422` (`invalid_package` / `invalid_payload`), `429` y `5xx`.
 7. **Subir a PuduHub** (proyecto sin vincular): `POST /` con el nombre y el
    tipo del proyecto. El rol Ingeniero puede crear informes y queda asignado
-   al que crea. Luego `GET /{id}/paquete` (PuduHub crea la version 1 vacia como
-   punto de control), se escribe el vinculo con base 1 y se envia con la
+   al que crea. Luego, como al abrir, se toma el bloqueo, se crea la version 1
+   (vacia) con `POST /{id}/versiones` y se baja; se escribe el vinculo con base
+   1 y se envia con la
    sincronizacion normal: como la base y el borrador del servidor son
    iguales, entra todo lo local sin conflictos. Si el envio falla, el informe
    ya existe y el proyecto queda vinculado para reintentar.

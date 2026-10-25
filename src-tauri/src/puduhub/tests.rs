@@ -264,7 +264,17 @@ struct HubState {
     /// Cambio del servidor que se aplica al fusionar.
     server_client: Option<String>,
     uploaded: Vec<Vec<u8>>,
+    /// Borrador con cambios de la web que aun no son version (paquete con el
+    /// contenido; la version la pone POST /versiones).
+    draft: Option<Vec<u8>>,
+    /// `X-Informe-Borrador-Pendiente` de la ultima version.
+    draft_pending: bool,
+    /// Cuerpos recibidos en POST /versiones.
+    checkpoints: Vec<Value>,
 }
+
+/// Revision del borrador en el simulador.
+const REVISION: u64 = 3;
 
 fn row(id: &str, version: u64) -> Value {
     json!({
@@ -287,8 +297,18 @@ fn fake_hub(id: &'static str, state: Arc<Mutex<HubState>>) -> Mock {
                 200,
                 json!({"items": [row(id, latest)], "total": 1, "page": 1, "pageSize": 20}),
             ),
+            ("GET", r) if r == format!("/{id}") => Reply::json(200, {
+                let mut detail = row(id, latest);
+                detail["proyecto"] = json!({});
+                detail["orden"] = json!([]);
+                detail["workspace"] = Value::Null;
+                detail["puedeForzar"] = json!(false);
+                detail
+            }),
             ("POST", "") => {
-                st.packages.insert(1, empty_package(id));
+                // Informe recien creado: borrador vacio y ninguna version.
+                st.draft = Some(empty_package(id));
+                st.draft_pending = true;
                 Reply::json(201, {
                     let mut detail = row(id, 0);
                     detail["proyecto"] = json!({});
@@ -297,15 +317,55 @@ fn fake_hub(id: &'static str, state: Arc<Mutex<HubState>>) -> Mock {
                 })
             }
             ("GET", r) if r == format!("/{id}/paquete") => {
-                let version = req
+                let requested = req
                     .query()
                     .strip_prefix("version=")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(latest);
+                    .and_then(|v| v.parse().ok());
+                if requested.is_none() && latest == 0 {
+                    return Reply::json(409, json!({"error": "version_required"}));
+                }
+                let version = requested.unwrap_or(latest);
                 match st.packages.get(&version) {
-                    Some(bytes) => Reply::zip(bytes.clone()),
+                    Some(bytes) => {
+                        let pending = version != latest || st.draft_pending;
+                        let mut reply = Reply::zip(bytes.clone());
+                        reply
+                            .headers
+                            .push(("X-Informe-Version".into(), version.to_string()));
+                        reply.headers.push((
+                            "X-Informe-Borrador-Pendiente".into(),
+                            if pending { "1" } else { "0" }.into(),
+                        ));
+                        reply
+                    }
                     None => Reply::json(404, json!({"error": "not_found"})),
                 }
+            }
+            ("POST", r) if r == format!("/{id}/versiones") => {
+                if req.header("x-lock-token") != Some(LOCK) {
+                    return Reply::json(409, json!({"error": "lock_required"}));
+                }
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                st.checkpoints.push(body.clone());
+                if body["revision"].as_u64() != Some(REVISION) {
+                    return Reply::json(
+                        409,
+                        json!({"error": "stale_revision", "revision": REVISION}),
+                    );
+                }
+                let source = match st.draft.take() {
+                    Some(draft) => draft,
+                    None => st.packages[&latest].clone(),
+                };
+                let next = latest + 1;
+                st.packages
+                    .insert(next, merged_package(&source, id, next, None));
+                st.draft_pending = false;
+                Reply::json(
+                    201,
+                    json!({"version": next, "origen": "escritorio", "motivo": body["motivo"],
+                           "revision": REVISION}),
+                )
             }
             ("POST", r) if r == format!("/{id}/bloqueo") => match &st.lock_reply {
                 Some((status, body)) => Reply::json(*status, body.clone()),
@@ -330,6 +390,8 @@ fn fake_hub(id: &'static str, state: Arc<Mutex<HubState>>) -> Mock {
                 let next = latest + 1;
                 let merged = merged_package(&req.body, id, next, st.server_client.as_deref());
                 st.packages.insert(next, merged);
+                st.draft = None;
+                st.draft_pending = false;
                 Reply::json(
                     200,
                     json!({"revision": 4, "version": {"version": next, "origen": "escritorio"}}),
@@ -793,6 +855,164 @@ fn bloqueo_tomado_informa_quien_y_hasta_cuando() {
     assert_eq!(mock.requests()[0].body, br#"{"forzar":true}"#);
 }
 
+/// Borrador del servidor: la version 1 con un cambio hecho en la web.
+fn web_draft(id: &str, client: &str) -> Vec<u8> {
+    merged_package(&initial_package(id), id, 1, Some(client))
+}
+
+#[test]
+fn abrir_crea_punto_de_control_con_cambios_de_la_web() {
+    let (mock, state) = hub_with_v1();
+    {
+        let mut st = state.lock().unwrap();
+        st.draft = Some(web_draft(ID, "Cambio en la web"));
+        st.draft_pending = true;
+    }
+    let client = client_for(&mock);
+    let root = tmp("open-checkpoint");
+    let opened = run(sync::open_informe(&client, &root, ID)).unwrap();
+    assert_eq!(opened.version, 2);
+    assert_eq!(opened.aviso, None);
+    assert_eq!(
+        mock.calls(),
+        [
+            format!("POST /api/editor/informes/{ID}/bloqueo"),
+            format!("GET /api/editor/informes/{ID}"),
+            format!("GET /api/editor/informes/{ID}/paquete"),
+            format!("POST /api/editor/informes/{ID}/versiones"),
+            format!("GET /api/editor/informes/{ID}/paquete?version=2"),
+            format!("DELETE /api/editor/informes/{ID}/bloqueo"),
+        ]
+    );
+    let requests = mock.requests();
+    assert_eq!(requests[0].body, br#"{"forzar":false}"#);
+    assert_eq!(requests[3].header("x-lock-token"), Some(LOCK));
+    assert_eq!(requests[5].header("x-lock-token"), Some(LOCK));
+    assert_eq!(
+        state.lock().unwrap().checkpoints,
+        [json!({"motivo": "Apertura desde PuduReport escritorio", "revision": REVISION})]
+    );
+    // El cambio de la web llego y es la base del vinculo.
+    let meta = workspace::read_project_meta(&root, &opened.proyecto_id).unwrap();
+    assert_eq!(meta.client, "Cambio en la web");
+    let status = sync::link_status(&root, &opened.proyecto_id, Some(client.servidor())).unwrap();
+    assert_eq!(status.base_version, Some(2));
+    assert!(!status.cambios_sin_enviar);
+
+    // Sin cambios pendientes no se crea otra version.
+    mock.requests.lock().unwrap().clear();
+    let again = run(sync::open_informe(&client, &root, ID)).unwrap();
+    assert_eq!((again.version, again.actualizado), (2, true));
+    assert_eq!(
+        mock.calls(),
+        [
+            format!("POST /api/editor/informes/{ID}/bloqueo"),
+            format!("GET /api/editor/informes/{ID}"),
+            format!("GET /api/editor/informes/{ID}/paquete"),
+            format!("DELETE /api/editor/informes/{ID}/bloqueo"),
+        ]
+    );
+    assert_eq!(state.lock().unwrap().checkpoints.len(), 1);
+}
+
+fn lock_held_by_other() -> (u16, Value) {
+    (
+        409,
+        json!({"error": "lock_held", "bloqueo": {"usuarioId": "u2", "nombre": "Ana Perez",
+            "hasta": "2026-10-25T12:15:00+00:00", "origen": "web", "propio": false}}),
+    )
+}
+
+#[test]
+fn abrir_con_bloqueo_ajeno_baja_la_ultima_version_y_avisa() {
+    let (mock, state) = hub_with_v1();
+    {
+        let mut st = state.lock().unwrap();
+        st.draft = Some(web_draft(ID, "Cambio en la web"));
+        st.draft_pending = true;
+        st.lock_reply = Some(lock_held_by_other());
+    }
+    let client = client_for(&mock);
+    let root = tmp("open-locked");
+    let opened = run(sync::open_informe(&client, &root, ID)).unwrap();
+    assert_eq!(opened.version, 1);
+    let aviso = opened.aviso.expect("aviso de cambios pendientes");
+    assert!(aviso.contains("no se incluyeron"), "{aviso}");
+    assert_eq!(
+        mock.calls(),
+        [
+            format!("POST /api/editor/informes/{ID}/bloqueo"),
+            format!("GET /api/editor/informes/{ID}/paquete"),
+        ]
+    );
+    assert!(state.lock().unwrap().checkpoints.is_empty());
+    let meta = workspace::read_project_meta(&root, &opened.proyecto_id).unwrap();
+    assert_ne!(meta.client, "Cambio en la web");
+    let status = sync::link_status(&root, &opened.proyecto_id, Some(client.servidor())).unwrap();
+    assert_eq!(status.base_version, Some(1));
+
+    // Sin cambios pendientes no hay aviso.
+    state.lock().unwrap().draft_pending = false;
+    let again = run(sync::open_informe(&client, &root, ID)).unwrap();
+    assert_eq!(again.aviso, None);
+}
+
+#[test]
+fn abrir_sin_versiones_con_bloqueo_ajeno_explica_version_requerida() {
+    let state = Arc::new(Mutex::new(HubState::default()));
+    {
+        let mut st = state.lock().unwrap();
+        st.draft = Some(empty_package(ID));
+        st.draft_pending = true;
+        st.lock_reply = Some(lock_held_by_other());
+    }
+    let mock = fake_hub(ID, Arc::clone(&state));
+    let root = tmp("open-no-version");
+    let error = run(sync::open_informe(&client_for(&mock), &root, ID)).unwrap_err();
+    assert_eq!(error.codigo, "sin_version");
+    assert!(
+        error.mensaje.contains("ninguna version"),
+        "{}",
+        error.mensaje
+    );
+    assert_no_token(&error);
+    assert_eq!(
+        mock.calls(),
+        [
+            format!("POST /api/editor/informes/{ID}/bloqueo"),
+            format!("GET /api/editor/informes/{ID}/paquete"),
+        ]
+    );
+    assert!(workspace::list_projects(&root).unwrap().is_empty());
+
+    // Con el bloqueo libre se crea la primera version.
+    state.lock().unwrap().lock_reply = None;
+    mock.requests.lock().unwrap().clear();
+    let opened = run(sync::open_informe(&client_for(&mock), &root, ID)).unwrap();
+    assert_eq!(opened.version, 1);
+    assert_eq!(
+        mock.calls(),
+        [
+            format!("POST /api/editor/informes/{ID}/bloqueo"),
+            format!("GET /api/editor/informes/{ID}"),
+            format!("POST /api/editor/informes/{ID}/versiones"),
+            format!("GET /api/editor/informes/{ID}/paquete?version=1"),
+            format!("DELETE /api/editor/informes/{ID}/bloqueo"),
+        ]
+    );
+}
+
+#[test]
+fn paquete_con_cabecera_de_version_distinta_se_rechaza() {
+    let mock = serve(Arc::new(|_req: &Request| {
+        let mut reply = Reply::zip(initial_package(ID));
+        reply.headers.push(("X-Informe-Version".into(), "7".into()));
+        reply
+    }));
+    let error = run(client_for(&mock).package(ID, Some(1))).unwrap_err();
+    assert_eq!(error.codigo, "respuesta_invalida");
+}
+
 #[test]
 fn errores_mapeados_por_codigo_sin_token_ni_cuerpo() {
     let cases: Vec<(u16, Value, &str)> = vec![
@@ -810,6 +1030,7 @@ fn errores_mapeados_por_codigo_sin_token_ni_cuerpo() {
             json!({"error": "unknown_base_version"}),
             "version_base_desconocida",
         ),
+        (409, json!({"error": "version_required"}), "sin_version"),
         (413, json!({"error": "payload_too_large"}), "paquete_grande"),
         (
             415,
@@ -870,7 +1091,7 @@ fn respuesta_demasiado_grande_se_corta() {
             },
         )
         .unwrap();
-        let error = run(client.package(ID, Some(1))).unwrap_err();
+        let error = run(async { client.package(ID, Some(1)).await?.bytes().await }).unwrap_err();
         assert_eq!(error.codigo, "respuesta_grande", "chunked={chunked}");
         let error = run(client.list(1, "")).unwrap_err();
         assert_eq!(error.codigo, "respuesta_grande", "chunked={chunked}");
@@ -962,7 +1183,12 @@ fn subir_como_informe_nuevo() {
         mock.calls(),
         [
             "POST /api/editor/informes".to_string(),
-            format!("GET /api/editor/informes/{NEW_ID}/paquete"),
+            // Sin versiones: punto de control del borrador recien creado.
+            format!("POST /api/editor/informes/{NEW_ID}/bloqueo"),
+            format!("GET /api/editor/informes/{NEW_ID}"),
+            format!("POST /api/editor/informes/{NEW_ID}/versiones"),
+            format!("GET /api/editor/informes/{NEW_ID}/paquete?version=1"),
+            format!("DELETE /api/editor/informes/{NEW_ID}/bloqueo"),
             format!("POST /api/editor/informes/{NEW_ID}/bloqueo"),
             format!("POST /api/editor/informes/{NEW_ID}/sincronizar"),
             format!("DELETE /api/editor/informes/{NEW_ID}/bloqueo"),

@@ -126,6 +126,7 @@ export function PuduHubProjectBar({ projectId, onBeforeSync, onReplaced }: Props
     if (!opened) return;
     onReplaced();
     notify(`Proyecto actualizado a la version ${opened.version} de PuduHub`, "ok");
+    if (opened.aviso) notify(opened.aviso, "info");
   }
 
   // Con respaldo: el proyecto actual queda como un proyecto aparte.
@@ -141,6 +142,7 @@ export function PuduHubProjectBar({ projectId, onBeforeSync, onReplaced }: Props
         : `Version ${result.version} descargada.`,
       "ok",
     );
+    if (result.aviso) notify(result.aviso, "info");
   }
 
   if (!status || (!status.vinculado && !status.vinculoInvalido && !connected)) return null;
