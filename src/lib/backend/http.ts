@@ -42,7 +42,8 @@ const WEB: Capabilities = {
   exportTargets: false,
   csvExport: false,
   templateEditing: false,
-  branding: false,
+  // Portada y marca del informe: workspace.yaml propio en PuduHub.
+  branding: true,
   localFiles: false,
   pagePreview: false,
   packages: false,
@@ -259,6 +260,8 @@ const IMAGE_TYPES: Record<string, string> = {
 
 /** `assets/<segmento>[/<segmento>...].<imagen>` con segmentos ASCII seguros. */
 const ASSET_PATH = /^assets(\/[A-Za-z0-9_-][A-Za-z0-9._-]{0,127})+\.(png|jpe?g|gif|webp)$/i;
+/** Referencia de marca de workspace.yaml: `/branding/<archivo>` plano. */
+const BRANDING_REF = /^\/branding\/[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}\.(png|jpe?g|gif|webp)$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function defaultReadCookie(name: string): string | null {
@@ -292,7 +295,7 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Marca por defecto: PuduHub no envia la del workspace al editor web. */
+/** Marca por defecto de PuduReport (PuduHub envia `workspace: null`). */
 function defaultWorkspace(): WorkspaceMeta {
   return {
     name: "PuduHub",
@@ -316,6 +319,21 @@ function defaultWorkspace(): WorkspaceMeta {
     project_order: [],
     export_targets: [],
   };
+}
+
+/** workspace.yaml del informe con los defaults de PuduReport para lo que falte. */
+function normalizeWorkspace(raw: unknown): WorkspaceMeta {
+  const base = defaultWorkspace();
+  if (!isObject(raw)) return base;
+  return {
+    ...base,
+    ...raw,
+    name: str(raw.name) || base.name,
+    branding: { ...base.branding, ...(isObject(raw.branding) ? raw.branding : {}) },
+    watermark: { ...base.watermark, ...(isObject(raw.watermark) ? raw.watermark : {}) },
+    project_order: [],
+    export_targets: [],
+  } as WorkspaceMeta;
 }
 
 /**
@@ -397,6 +415,8 @@ export class HttpBackend implements Backend {
   private lastPdf: string | null = null;
   /** `InformeDetail.puedeForzar` si PuduHub lo envia; null = no informado. */
   private canForce: boolean | null = null;
+  /** workspace.yaml del informe (`InformeDetail.workspace`; null = defaults). */
+  private workspace: WorkspaceMeta = defaultWorkspace();
   private unloadInstalled = false;
 
   constructor(options: HttpBackendOptions) {
@@ -482,7 +502,11 @@ export class HttpBackend implements Backend {
 
   /** POST /bloqueo: toma o renueva (con X-Lock-Token). El token llega solo al tomarlo. */
   private async takeLock(forzar = false): Promise<void> {
-    const body = await this.request("POST", "/bloqueo", { json: { forzar } });
+    // La revision vista permite renovar un bloqueo propio vencido que nadie tomo;
+    // si el borrador cambio, PuduHub responde lock_required (recargar).
+    const json: Json = { forzar };
+    if (this.revision !== null) json.revision = this.revision;
+    const body = await this.request("POST", "/bloqueo", { json });
     if (isObject(body) && typeof body.token === "string" && body.token) {
       this.lockToken = body.token;
     }
@@ -495,6 +519,8 @@ export class HttpBackend implements Backend {
   private startRenewal() {
     if (this.renewTimer) clearInterval(this.renewTimer);
     this.renewTimer = setInterval(() => void this.renewLock(), this.lockRenewMs);
+    // En Node (pruebas) el temporizador no debe mantener vivo el proceso.
+    (this.renewTimer as { unref?: () => void }).unref?.();
   }
 
   /** Renueva el bloqueo; si se perdio, bloquea las escrituras y avisa. */
@@ -662,6 +688,7 @@ export class HttpBackend implements Backend {
     }
     this.checkRevision(body);
     if (typeof body.puedeForzar === "boolean") this.canForce = body.puedeForzar;
+    if ("workspace" in body) this.workspace = normalizeWorkspace(body.workspace);
     return normalizeProject(body.proyecto, body.orden);
   }
 
@@ -674,8 +701,11 @@ export class HttpBackend implements Backend {
     return `${this.apiBase}/${encodeURIComponent(this.informeId)}/assets/${encoded}`;
   }
 
-  brandingAssetUrl(): string {
-    return "";
+  /** `/branding/x.png` de workspace.yaml -> GET /{id}/assets/branding/x.png. */
+  brandingAssetUrl(path: string): string {
+    if (!BRANDING_REF.test(path)) return "";
+    const encoded = path.slice(1).split("/").map(encodeURIComponent).join("/");
+    return `${this.apiBase}/${encodeURIComponent(this.informeId)}/assets/${encoded}`;
   }
 
   setWindowTitle(title: string): void {
@@ -699,7 +729,17 @@ export class HttpBackend implements Backend {
   }
 
   async getWorkspaceMeta(): Promise<WorkspaceMeta> {
-    return defaultWorkspace();
+    return this.workspace;
+  }
+
+  /** PUT /{id}/workspace {workspace, revision} -> Revision. */
+  async saveWorkspaceMeta(meta: WorkspaceMeta): Promise<void> {
+    await this.write(async (revision) => {
+      // Solo la parte portable: PuduHub descarta tablero y destinos de API.
+      const workspace = { name: meta.name, branding: meta.branding, watermark: meta.watermark };
+      this.takeRevision(await this.request("PUT", "/workspace", { json: { workspace, revision } }));
+      this.workspace = normalizeWorkspace(workspace);
+    });
   }
 
   async listProjects(): Promise<ProjectSummary[]> {
@@ -726,7 +766,15 @@ export class HttpBackend implements Backend {
    */
   async listFindings(projectId: string): Promise<Finding[]> {
     await this.checkProject(projectId);
-    const body = await this.request("GET", "/hallazgos", { query: { incluirCuerpo: "1" } });
+    let body: unknown;
+    try {
+      body = await this.request("GET", "/hallazgos", { query: { incluirCuerpo: "1" } });
+    } catch (error) {
+      // Con todos los cuerpos supera el limite de PuduHub (413): lista sin
+      // cuerpos y lectura de cada hallazgo.
+      if (!(error instanceof BackendError) || error.status !== 413) throw error;
+      body = await this.request("GET", "/hallazgos");
+    }
     const items = (Array.isArray(body) ? body.filter(isObject) : []).filter(
       (item) => typeof item.id === "string" && item.id !== "",
     );
@@ -797,32 +845,49 @@ export class HttpBackend implements Backend {
     });
   }
 
-  /** POST /{id}/assets?revision=&destino=assets&nombre= (cuerpo binario) -> AssetView. */
-  async saveAsset(projectId: string, ext: string, dataBase64: string): Promise<string> {
-    await this.checkProject(projectId);
+  /** POST /{id}/assets?revision=&destino=&nombre= (cuerpo binario) -> AssetView. */
+  private uploadImage(
+    destino: "assets" | "branding",
+    ext: string,
+    dataBase64: string,
+  ): Promise<Json> {
     const clean = ext.toLowerCase().replace(/[^a-z0-9]/g, "");
     const type = IMAGE_TYPES[clean];
     if (!type) {
-      throw new BackendError(
-        415,
-        "unsupported",
-        "Solo se permiten imagenes PNG, JPEG, GIF o WebP.",
+      return Promise.reject(
+        new BackendError(415, "unsupported", "Solo se permiten imagenes PNG, JPEG, GIF o WebP."),
       );
     }
     const bytes = base64ToBytes(dataBase64);
+    const nombre = `${destino === "branding" ? "marca" : "evidencia"}.${clean}`;
     return this.write(async (revision) => {
       const body = await this.request("POST", "/assets", {
         body: bytes,
         contentType: type,
-        query: { revision: String(revision), destino: "assets", nombre: `evidencia.${clean}` },
+        query: { revision: String(revision), destino, nombre },
       });
       this.takeRevision(body);
-      const ruta = isObject(body) ? str(body.ruta) : "";
-      if (!ASSET_PATH.test(ruta)) {
-        throw new BackendError(502, "invalid_payload", "PuduHub no devolvio la ruta de la imagen.");
-      }
-      return ruta;
+      return isObject(body) ? body : {};
     });
+  }
+
+  /** Evidencia: devuelve la ruta `assets/...` para el markdown. */
+  async saveAsset(projectId: string, ext: string, dataBase64: string): Promise<string> {
+    await this.checkProject(projectId);
+    const ruta = str((await this.uploadImage("assets", ext, dataBase64)).ruta);
+    if (!ASSET_PATH.test(ruta)) {
+      throw new BackendError(502, "invalid_payload", "PuduHub no devolvio la ruta de la imagen.");
+    }
+    return ruta;
+  }
+
+  /** Marca: devuelve la referencia `/branding/...` para workspace.yaml. */
+  async saveBrandingAsset(ext: string, dataBase64: string): Promise<string> {
+    const referencia = str((await this.uploadImage("branding", ext, dataBase64)).referencia);
+    if (!BRANDING_REF.test(referencia)) {
+      throw new BackendError(502, "invalid_payload", "PuduHub no devolvio la ruta de la imagen.");
+    }
+    return referencia;
   }
 
   /** POST {apiBase}/cvss {vector} -> {score, severity, vector, version}. */
@@ -915,14 +980,12 @@ export class HttpBackend implements Backend {
   removeRecentWorkspace = (): Promise<void> => unsupported();
   openWorkspace = (): Promise<WorkspaceMeta> => unsupported();
   createWorkspace = (): Promise<WorkspaceMeta> => unsupported();
-  saveWorkspaceMeta = (): Promise<void> => unsupported();
   workspaceStats = (): Promise<WorkspaceStats> => unsupported();
   createProject = (): Promise<ProjectSummary> => unsupported();
   createExampleProject = (): Promise<ProjectSummary> => unsupported();
   deleteProject = (): Promise<void> => unsupported();
   assignProjectClosure = (): Promise<ProjectAssignment> => unsupported();
   reorderProjects = (): Promise<void> => unsupported();
-  saveBrandingAsset = (): Promise<string> => unsupported();
   listFindingTemplates = (): Promise<FindingTemplate[]> => Promise.resolve([]);
   saveFindingTemplate = (): Promise<void> => unsupported();
   instantiateTemplate = (): Promise<Finding> => unsupported();

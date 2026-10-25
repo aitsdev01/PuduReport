@@ -21,8 +21,9 @@ import { FindingEditor } from "../views/FindingEditor";
 import { ContentEditor } from "../views/ContentEditor";
 import { ReportBuilder } from "../views/ReportBuilder";
 import { PdfPreview } from "../screens/PdfPreview";
+import { CoverEditor } from "../screens/CoverEditor";
 
-type WebView = "editor" | "reporte" | "preview";
+type WebView = "editor" | "reporte" | "portada" | "preview";
 
 type OpenState =
   | { kind: "opening" }
@@ -194,6 +195,10 @@ function WebInner({ backend }: Props) {
       icon: freeMarkdown ? "ti-markdown" : "ti-bug",
     },
     { view: "reporte", label: "Reporte", icon: "ti-file-text" },
+    // Portada y marca: workspace.yaml propio del informe en PuduHub.
+    ...(api.capabilities().branding
+      ? [{ view: "portada" as const, label: "Portada y marca", icon: "ti-layout-cards" }]
+      : []),
     { view: "preview", label: "PDF", icon: "ti-file-type-pdf" },
   ];
   const lockHora = formatHasta(lockUntil);
@@ -285,6 +290,14 @@ function WebInner({ backend }: Props) {
               onProjectMetaChange={setProject}
               onGoToPreview={() => void navigate("preview")}
               onPickProject={() => undefined}
+            />
+          )}
+          {view === "portada" && workspace && (
+            <CoverEditor
+              workspace={workspace}
+              // Sin ruta local: la capa web resuelve /branding/... contra PuduHub.
+              workspacePath={projectId}
+              onWorkspaceSaved={setWorkspace}
             />
           )}
           {view === "preview" && (

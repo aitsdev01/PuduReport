@@ -109,7 +109,7 @@ test("abre el informe: documento, bloqueo y escrituras con revision, CSRF y X-Lo
   assert.deepEqual(await backend.open(), { kind: "ready" });
   assert.equal(backend.currentRevision, 7);
   const lock = calls.find((c) => c.path.endsWith("/bloqueo"));
-  assert.deepEqual(lock.body, { forzar: false });
+  assert.deepEqual(lock.body, { forzar: false, revision: 7 });
 
   const project = await backend.loadProject(ID);
   assert.deepEqual(project.finding_order, ["001-a"]);
@@ -425,6 +425,101 @@ test("puedeForzar de PuduHub manda; sin la marca, solo la sesion propia", async 
     [`POST ${BASE}/${ID}/bloqueo`]: () => held(true),
   });
   assert.equal((await denied.backend.open()).puedeForzar, false);
+});
+
+test("hallazgos: 413 con cuerpos cae a la lista sin cuerpos y lectura por hallazgo", async () => {
+  const { backend, calls } = backendWith({
+    ...baseRoutes,
+    [`GET ${BASE}/${ID}/hallazgos`]: (call) =>
+      call.query.get("incluirCuerpo") === "1"
+        ? json(413, { error: "too_large" })
+        : json(200, [{ id: "001-a", meta: { title: "A" } }]),
+    [`GET ${BASE}/${ID}/hallazgos/001-a`]: () =>
+      json(200, { id: "001-a", meta: { title: "A" }, body: "cuerpo A", revision: 7 }),
+  });
+  await backend.open();
+  const list = await backend.listFindings(ID);
+  assert.deepEqual(
+    list.map((f) => [f.id, f.body]),
+    [["001-a", "cuerpo A"]],
+  );
+  assert.equal(calls.filter((c) => c.path.endsWith("/hallazgos")).length, 2);
+  await backend.release();
+});
+
+test("renovar el bloqueo envia la revision vigente", async () => {
+  const { backend, calls } = backendWith(baseRoutes);
+  await backend.open();
+  await backend.renewLock();
+  const renew = calls.filter((c) => c.path.endsWith("/bloqueo") && c.method === "POST").at(-1);
+  assert.deepEqual(renew.body, { forzar: false, revision: 7 });
+  assert.equal(renew.headers["X-Lock-Token"], "lock-1");
+  await backend.release();
+});
+
+test("portada y marca: workspace del informe, guardado y subida de marca", async () => {
+  const { backend, calls } = backendWith({
+    ...baseRoutes,
+    [`GET ${BASE}/${ID}`]: () =>
+      json(200, {
+        ...informe(),
+        workspace: { name: "ACME", branding: { primary_color: "#0f6e56" } },
+      }),
+    [`PUT ${BASE}/${ID}/workspace`]: (call) => {
+      assert.equal(call.body.revision, 8);
+      assert.deepEqual(Object.keys(call.body.workspace).sort(), ["branding", "name", "watermark"]);
+      return json(200, { revision: 9 });
+    },
+    [`POST ${BASE}/${ID}/assets`]: (call) => {
+      assert.equal(call.query.get("destino"), "branding");
+      return json(201, {
+        ruta: "branding/marca-0123456789ab.png",
+        referencia: "/branding/marca-0123456789ab.png",
+        sha256: "0".repeat(64),
+        bytes: 2,
+        contentType: "image/png",
+        revision: 8,
+      });
+    },
+  });
+  await backend.open();
+  const ws = await backend.getWorkspaceMeta();
+  assert.equal(ws.name, "ACME");
+  assert.equal(ws.branding.primary_color, "#0f6e56");
+  assert.equal(ws.branding.cover_layout, "centered", "defaults para lo que falta");
+
+  const ref = await backend.saveBrandingAsset("png", Buffer.from([0x89, 0x50]).toString("base64"));
+  assert.equal(ref, "/branding/marca-0123456789ab.png");
+  assert.equal(
+    backend.brandingAssetUrl(ref),
+    `${BASE}/${ID}/assets/branding/marca-0123456789ab.png`,
+  );
+  for (const bad of ["/branding/../x.png", "/etc/passwd", "branding/x.png", "/branding/a/b.png"]) {
+    assert.equal(backend.brandingAssetUrl(bad), "", bad);
+  }
+
+  await backend.saveWorkspaceMeta({
+    ...ws,
+    branding: { ...ws.branding, logo_path: ref },
+    project_order: ["x"],
+    export_targets: [],
+  });
+  assert.equal(backend.currentRevision, 9);
+  assert.equal((await backend.getWorkspaceMeta()).branding.logo_path, ref);
+  assert.ok(calls.some((c) => c.path.endsWith("/workspace")));
+  await backend.release();
+});
+
+test("workspace null: defaults de PuduReport", async () => {
+  const { backend } = backendWith({
+    ...baseRoutes,
+    [`GET ${BASE}/${ID}`]: () => json(200, { ...informe(), workspace: null, puedeForzar: false }),
+  });
+  await backend.open();
+  const ws = await backend.getWorkspaceMeta();
+  assert.equal(ws.branding.cover_layout, "centered");
+  assert.equal(ws.watermark.enabled, false);
+  await backend.release();
 });
 
 test("mensajes de error claros", () => {

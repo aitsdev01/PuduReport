@@ -44,7 +44,8 @@ Ademas de las operaciones de siempre, `api.ts` expone:
 
 - `capabilities()`: que puede hacer la capa activa. En web estan apagados
   workspaces, tablero de proyectos, git, MCP, destinos de API, CSV, plantillas,
-  portada y marca, rutas locales, vista previa por pagina y paquetes. Las
+  rutas locales, vista previa por pagina y paquetes (portada y marca si: son
+  del informe). Las
   pantallas ocultan esos controles.
 - `assetUrl(projectId, ruta)` y `brandingAssetUrl(ruta)`: reemplazan el uso
   directo de `convertFileSrc`. En web la evidencia `assets/x.png` se sirve en
@@ -62,13 +63,16 @@ Sigue la API de informes de PuduHub (`/api/admin/informes`, sesion BFF):
   (la sesion rota y la cookie con ella) y envia la cookie `XSRF-TOKEN` en la
   cabecera `X-XSRF-TOKEN`. Las escrituras no se reintentan.
 - Trabaja sobre un solo informe. Al abrir: `GET /{id}` y
-  `POST /{id}/bloqueo` `{"forzar": false}`. El token del bloqueo llega solo al
-  tomarlo (`LockView.token`) y se envia en `X-Lock-Token` en toda escritura,
-  renovacion (`POST /{id}/bloqueo` cada 60 s; vence a los 15 min) y al liberar
-  (`DELETE /{id}/bloqueo`, con `keepalive` al cerrar la pagina).
-- Si PuduHub indica `puedeForzar: true` en `InformeDetail`, el editor ofrece
-  "Tomar el bloqueo aqui" (`forzar: true`). Sin esa marca solo lo ofrece si el
-  bloqueo es de otra sesion del mismo usuario (`bloqueo.propio`). En los demas
+  `POST /{id}/bloqueo` `{"forzar": false, "revision": N}`. El token del bloqueo
+  llega solo al tomarlo (`LockView.token`) y se envia en `X-Lock-Token` en toda
+  escritura, renovacion (`POST /{id}/bloqueo` cada 60 s con la `revision`
+  vigente; vence a los 15 min) y al liberar (`DELETE /{id}/bloqueo`, con
+  `keepalive` al cerrar la pagina). Un bloqueo propio vencido que nadie tomo se
+  renueva con el mismo token si la revision coincide; si no, PuduHub responde
+  `lock_required` y el editor pide recargar.
+- Si PuduHub indica `puedeForzar: true` en `InformeDetail` (solo para un
+  bloqueo propio de otra sesion o del escritorio), el editor ofrece "Tomar el
+  bloqueo aqui" (`forzar: true`). Sin esa marca usa `bloqueo.propio`. En los demas
   casos muestra quien y hasta cuando y permite reintentar.
 - Las escrituras se serializan en una cola: cada una envia la `revision`
   vigente y toma la nueva de la respuesta. Asi dos guardados casi simultaneos
@@ -86,17 +90,19 @@ Sigue la API de informes de PuduHub (`/api/admin/informes`, sesion BFF):
 
 | Peticion | Cuerpo | Respuesta que usa el editor |
 |---|---|---|
-| `GET /{id}` | - | `InformeDetail`: `revision`, `proyecto` (ProjectMeta), `orden`, `puedeForzar` (opcional) |
-| `POST /{id}/bloqueo` | `{forzar}` | `LockView`: `token` (solo al tomar), `bloqueo.hasta`, `revision` |
+| `GET /{id}` | - | `InformeDetail`: `revision`, `proyecto` (ProjectMeta), `orden`, `workspace` (WorkspaceMeta o `null` = defaults), `puedeForzar` |
+| `PUT /{id}/workspace` | `{workspace: {name, branding, watermark}, revision}` | `Revision` |
+| `POST /{id}/bloqueo` | `{forzar, revision}` | `LockView`: `token` (solo al tomar), `bloqueo.hasta`, `revision` |
 | `DELETE /{id}/bloqueo` | - | `Revision` |
 | `PUT /{id}/proyecto` | `{meta, revision}` | `Revision` |
-| `GET /{id}/hallazgos?incluirCuerpo=1` | - | `[{id, meta, body}]`; si un elemento llega sin `body`, se lee con `GET /{id}/hallazgos/{uid}` (`Hallazgo`), hasta 6 en paralelo |
+| `GET /{id}/hallazgos?incluirCuerpo=1` | - | `[{id, meta, body}]`. Con `413 too_large` (mas de 25 MiB) o elementos sin `body`, se usa la lista sin cuerpos y `GET /{id}/hallazgos/{uid}` (`Hallazgo`), hasta 6 en paralelo |
 | `POST /{id}/hallazgos` | `{titulo, revision}` | `Hallazgo` (PuduHub asigna el id `NNN-slug`) |
 | `PUT /{id}/hallazgos/{uid}` | `{meta, body, revision}` | `Revision` |
 | `DELETE /{id}/hallazgos/{uid}?revision=N` | - | `Revision` |
 | `PUT /{id}/orden` | `{orden, revision}` | `Revision` |
 | `POST /{id}/assets?revision=N&destino=assets&nombre=evidencia.png` | bytes, un solo `Content-Type: image/*` | `AssetView`: `ruta`, `revision` |
-| `GET /{id}/assets/{ruta}` | - | la imagen |
+| `POST /{id}/assets?revision=N&destino=branding&nombre=marca.png` | bytes, un solo `Content-Type: image/*` | `AssetView`: `ruta: "branding/x.png"`, `referencia: "/branding/x.png"` (la que se guarda en `workspace.branding`), `revision` |
+| `GET /{id}/assets/{ruta}` | - | la imagen: evidencia en `/{id}/assets/assets/x.png`, marca en `/{id}/assets/branding/x.png` |
 | `POST /{id}/pdf` | `{}` | `PdfJob`: `id`, `estado`, `errorCodigo` |
 | `GET /{id}/pdf/{trabajo}` | - | `PdfJob` |
 | `GET /{id}/pdf/{trabajo}/archivo` | - | PDF (Admin) o `403` |
@@ -107,6 +113,10 @@ Errores: `{"error": "<codigo>", ...detalles}`. `lock_held` trae
 `revision`. PuduHub omite las listas vacias del proyecto (por ejemplo
 `layout`); el editor las completa al leer y conserva las claves que no conoce
 al guardar.
+
+`POST /` de PuduHub crea cada informe con la estructura de
+`POST /v1/proyecto-inicial` del servicio (secciones y layout del tipo), asi un
+informe nuevo abre en la web igual que un proyecto nuevo de escritorio.
 
 ## Editor web (`npm run build:web`)
 
@@ -130,9 +140,11 @@ PUDU_WEB_BASE=/editor/ VITE_PUDU_API_BASE=/api/admin/informes npm run build:web
 #   https://hub.example/editor/?informe=0f8fad5b-d9cb-469f-a165-70867728950e
 ```
 
-El shell web (`src/web/WebApp.tsx`) muestra solo Hallazgos o Contenido,
-Reporte y PDF, con el indicador de bloqueo. Reutiliza `FindingEditor`,
-`ContentEditor`, `ReportBuilder` y `PdfPreview`.
+El shell web (`src/web/WebApp.tsx`) muestra Hallazgos o Contenido, Reporte,
+Portada y marca, y PDF, con el indicador de bloqueo. Reutiliza `FindingEditor`,
+`ContentEditor`, `ReportBuilder`, `CoverEditor` y `PdfPreview`. La portada y la
+marca son del informe (`workspace` en PuduHub), no de un workspace local; la
+marca de agua se edita en Ajustes de escritorio y en web solo se conserva.
 
 ## Paquete `.pudupkg` (`core/src/package.rs`)
 

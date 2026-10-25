@@ -108,7 +108,11 @@ export function CoverEditor({ workspace, workspacePath, onWorkspaceSaved }: Prop
       <div className="screen-head">
         <div>
           <h1>Portada y marca</h1>
-          <p className="sub">Logo, colores y marca de agua. Se aplican a todos los reportes.</p>
+          <p className="sub">
+            {api.capabilities().mode === "web"
+              ? "Logo, colores y marca de agua de este informe."
+              : "Logo, colores y marca de agua. Se aplican a todos los reportes."}
+          </p>
         </div>
       </div>
 
