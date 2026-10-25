@@ -30,6 +30,7 @@ import * as api from "../lib/api";
 import { PromptDialog } from "./PromptDialog";
 import { ImageAnnotator } from "./ImageAnnotator";
 import { formatMarkdown, type MarkdownAction } from "../lib/markdownFormatting";
+import { BLOCKED_IMAGE_LABEL, resolveImageSrc } from "../lib/imageSrc";
 
 // Resaltado de sintaxis para los bloques de codigo (se empaqueta, sin red).
 const lowlight = createLowlight();
@@ -78,10 +79,15 @@ interface Props {
 }
 
 /** Resuelve una ruta relativa de asset a una URL cargable (la capa de datos
- * decide: protocolo asset en escritorio, API del informe en web). */
-function resolveSrc(src: string, base?: string | null, projectId?: string | null): string {
-  if (!base || !projectId || !src || /^(data:|https?:|asset:|blob:)/.test(src)) return src;
-  return api.assetUrl(projectId, src);
+ * decide: protocolo asset en escritorio, API del informe en web). `null` si
+ * no se debe cargar (en web, todo lo que no sea una evidencia del paquete). */
+function resolveSrc(src: string, base?: string | null, projectId?: string | null): string | null {
+  return resolveImageSrc(src, {
+    mode: api.capabilities().mode,
+    base,
+    projectId,
+    assetUrl: api.assetUrl,
+  });
 }
 
 /** Interpreta el alt como un ancho ("60%" o "60") y devuelve "NN%" o null. */
@@ -223,7 +229,7 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
     const editor = editorRef.current;
     if (!editor) return;
     const rel = String(editor.getAttributes("image").src ?? "");
-    if (rel) setAnnotateRel(rel);
+    if (rel && resolveSrc(rel, assetBase, projectId) !== null) setAnnotateRel(rel);
   }
 
   // Guarda el PNG anotado como un asset nuevo y lo deja en lugar del original
@@ -246,10 +252,19 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
   const AssetImage = Image.extend({
     renderHTML({ HTMLAttributes }) {
       const rel = String(HTMLAttributes.src ?? "");
+      const src = resolveSrc(rel, assetBase, projectId);
+      if (src === null) {
+        // Aviso neutro en lugar de la imagen; el markdown conserva la ruta.
+        return [
+          "span",
+          { class: "md-image-blocked", title: rel.slice(0, 200) },
+          BLOCKED_IMAGE_LABEL,
+        ];
+      }
       const width = parseWidth(String(HTMLAttributes.alt ?? ""));
       const attrs: Record<string, string> = {
         ...HTMLAttributes,
-        src: resolveSrc(rel, assetBase, projectId),
+        src,
       };
       if (width) attrs.style = `width:${width}`;
       return ["img", attrs];
@@ -369,7 +384,7 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
       )}
       {annotateRel && (
         <ImageAnnotator
-          src={resolveSrc(annotateRel, assetBase, projectId)}
+          src={resolveSrc(annotateRel, assetBase, projectId) ?? ""}
           onCancel={() => setAnnotateRel(null)}
           onConfirm={(dataUrl) => void handleAnnotateConfirm(dataUrl)}
         />

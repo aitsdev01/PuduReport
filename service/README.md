@@ -31,8 +31,15 @@ Arquitectura y formato de paquete: [docs/modo-servidor.md](../docs/modo-servidor
 - Errores: JSON `{"error": "<codigo>", "detalle"?: "..."}`. `401 unauthorized`,
   `413 payload_too_large` / `package_too_large`, `415 unsupported_media_type`,
   `422 invalid_package` / `unknown_template` / `render_failed` /
-  `invalid_vector` / `invalid_payload` / `invalid_type`, `503 busy` (con `Retry-After`),
-  `504 render_timeout`.
+  `invalid_vector` / `invalid_payload` / `invalid_type`, `408 upload_timeout`,
+  `503 busy` (con `Retry-After`), `504 render_timeout`.
+- Orden de `/v1/render`: clave, tipo de contenido, `Content-Length` (si supera
+  el limite, `413` sin leer el cuerpo), plantilla y cupo de concurrencia
+  (`503` sin leer el cuerpo). Solo con el cupo tomado se lee el cuerpo, con el
+  limite aplicado mientras llega (tambien sin `Content-Length`) y con
+  `PUDUREPORT_SERVICE_UPLOAD_TIMEOUT_SECS` como tope de tiempo.
+- `render_failed` tambien cubre un Markdown que, al convertirlo, supera
+  `max(8 x entrada, 1 MiB)` (tope de 64 MiB por texto).
 
 ## Configuracion (variables de entorno)
 
@@ -44,11 +51,18 @@ Arquitectura y formato de paquete: [docs/modo-servidor.md](../docs/modo-servidor
 | `PUDU_TYPST_BIN` | `typst` del PATH | Binario de Typst. |
 | `PUDUREPORT_SERVICE_MAX_BYTES` | `209715200` (200 MiB) | Tamano maximo del paquete. |
 | `PUDUREPORT_SERVICE_TIMEOUT_SECS` | `60` | Tiempo maximo de Typst; al vencer se mata el proceso. |
+| `PUDUREPORT_SERVICE_UPLOAD_TIMEOUT_SECS` | `120` | Tiempo maximo para recibir el paquete; al vencer, `408` y se libera el cupo. |
 | `PUDUREPORT_SERVICE_CONCURRENCY` | `2` | Renders simultaneos; el resto recibe `503`. |
 | `PUDUREPORT_SERVICE_TMPDIR` | temporal del sistema | Base de los temporales por trabajo (se borran siempre). |
 
 Sin clave, o con una clave corta, el servicio no arranca. Si Typst no responde
 a `--version`, tampoco.
+
+Typst corre con el entorno vacio salvo `PATH`, `HOME`, `TMPDIR`/`TMP`/`TEMP`,
+`LANG`/`LC_ALL`/`LC_CTYPE`, `TYPST_FONT_PATHS`, `SOURCE_DATE_EPOCH`, las
+variables XDG y de fontconfig (y las del sistema en Windows). Ni
+`PUDUREPORT_SERVICE_KEY` ni ninguna otra variable del servicio llegan al
+proceso hijo. Cada render usa `typst compile --jobs 1`.
 
 ## Ejecutar en local
 
@@ -87,9 +101,23 @@ docker run --rm -p 8080:8080 --read-only --tmpfs /tmp \
 - En el cluster: solo red interna, NetworkPolicy sin salida a Internet y
   limites de CPU y memoria acordes a `PUDUREPORT_SERVICE_CONCURRENCY`.
 
+### Limites recomendados del contenedor
+
+Con los valores por defecto (`PUDUREPORT_SERVICE_CONCURRENCY=2`, paquete de
+hasta 200 MiB): memoria 1 GiB y 256 procesos (`--memory 1g --pids-limit 256`;
+es lo que fija el compose de PuduHub). Cada render retiene el paquete
+comprimido, su copia descomprimida en el temporal y el proceso de Typst (un
+hilo por render); si se sube la concurrencia o el tamano maximo, subir la
+memoria en proporcion. El limite de procesos acota a Typst si algo lo hiciera
+crear procesos o hilos sin control. Con `/tmp` en `tmpfs`, su tamano tambien
+cuenta como memoria.
+
 ## Pruebas
 
 `cargo test -p pudureport-service` ejercita el router completo: render del
 proyecto de ejemplo a PDF (se omite si no hay Typst), CVSS 3.1 y 4.0, clave
-ausente o incorrecta, limite de tamano, tipo de contenido, paquetes con
-`../` (zip-slip) y `proyecto-inicial` (todos los tipos y validacion).
+ausente o incorrecta, limite de tamano (declarado, sin `Content-Length` y sin
+fin), subida que no termina, `503 busy` sin leer el cuerpo, tipo de contenido,
+paquetes con `../` (zip-slip) y `proyecto-inicial` (todos los tipos y
+validacion). `tests/typst_env.rs` usa un Typst falso que vuelca su entorno para
+comprobar que la clave no llega al proceso hijo y que se pasa `--jobs 1`.

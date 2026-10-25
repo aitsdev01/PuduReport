@@ -25,6 +25,12 @@ El conversor `core/src/markdown.rs` utiliza pulldown-cmark offline:
 Conserva los saltos entre filas. Una tabla previamente aplanada a una sola
 linea ya no tiene estructura GFM; el conversor no puede reconstruirla.
 
+El anidamiento se refleja hasta 16 niveles (sangria de listas, citas y
+negrita/cursiva); mas adentro el texto se conserva sin sumar niveles. Si la
+conversion de un texto supera `max(8 x su tamano, 1 MiB)` (64 MiB como
+maximo), la exportacion falla con un mensaje claro en lugar de agotar la
+memoria; pasa solo con contenido disenado para amplificarse.
+
 HTML embebido se omite; no se soportan tablas HTML, celdas combinadas,
 notas al pie, matematicas ni extensiones GFM de tareas/tachado. No se promete
 fidelidad de un navegador HTML. Para inventarios muy anchos, dividir columnas

@@ -43,6 +43,8 @@ pub enum PdfError {
     TypstNotFound,
     #[error("la generacion del PDF supero el tiempo limite de {0} s")]
     Timeout(u64),
+    #[error("{0}")]
+    Markdown(#[from] markdown::MarkdownError),
 }
 
 type Result<T> = std::result::Result<T, PdfError>;
@@ -222,7 +224,7 @@ fn status_str(s: crate::models::FindingStatus) -> String {
 /// Prepara el layout para data.json: convierte el cuerpo de los bloques de
 /// texto libre (markdown) a markup de Typst, igual que las secciones. El resto
 /// de los bloques pasa tal cual.
-fn layout_for_data(layout: Vec<ReportBlock>) -> Vec<ReportBlock> {
+fn layout_for_data(layout: Vec<ReportBlock>) -> Result<Vec<ReportBlock>> {
     layout
         .into_iter()
         .map(|mut b| {
@@ -233,12 +235,12 @@ fn layout_for_data(layout: Vec<ReportBlock>) -> Vec<ReportBlock> {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 if let Some(body) = body {
-                    let typ = markdown::to_typst(&body);
+                    let typ = markdown::to_typst(&body)?;
                     b.config
                         .insert("body".to_string(), serde_json::Value::String(typ));
                 }
             }
-            b
+            Ok(b)
         })
         .collect()
 }
@@ -260,7 +262,7 @@ fn build_data(root: &Path, project_id: &str) -> Result<DataDoc> {
     let findings_data: Vec<FindingData> = findings
         .into_iter()
         .enumerate()
-        .map(|(i, f)| {
+        .map(|(i, f)| -> Result<FindingData> {
             counts.add(f.meta.severity);
             // Campos ocultados puntualmente (sin ocultar el hallazgo entero):
             // "affected" se vacia (las plantillas ya omiten la linea si el
@@ -273,7 +275,7 @@ fn build_data(root: &Path, project_id: &str) -> Result<DataDoc> {
                 f.meta.affected
             };
             let body = sections::strip_hidden_sections(&f.body, &f.meta.hidden_fields);
-            FindingData {
+            Ok(FindingData {
                 id: f.id,
                 number: i + 1,
                 title: f.meta.title,
@@ -290,10 +292,10 @@ fn build_data(root: &Path, project_id: &str) -> Result<DataDoc> {
                 impacto_negocio: f.meta.impacto_negocio.trim().to_string(),
                 categoria_riesgo: f.meta.categoria_riesgo,
                 causa_raiz: f.meta.causa_raiz,
-                body: markdown::to_typst(&body),
-            }
+                body: markdown::to_typst(&body)?,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let causas_raiz = root_causes_data(&project, &findings_data);
     let plan_remediacion = remediation_plan_data(&project, &findings_data);
@@ -304,12 +306,14 @@ fn build_data(root: &Path, project_id: &str) -> Result<DataDoc> {
         .sections
         .into_iter()
         .filter(|s| s.enabled)
-        .map(|s| SectionData {
-            key: s.key,
-            title: s.title,
-            body: markdown::to_typst(&s.body),
+        .map(|s| {
+            Ok(SectionData {
+                body: markdown::to_typst(&s.body)?,
+                key: s.key,
+                title: s.title,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     Ok(DataDoc {
         workspace: WorkspaceData {
@@ -329,11 +333,11 @@ fn build_data(root: &Path, project_id: &str) -> Result<DataDoc> {
             scope: project
                 .scope
                 .into_iter()
-                .map(|s| markdown::to_typst(&s))
-                .collect(),
+                .map(|s| markdown::to_typst(&s).map_err(PdfError::from))
+                .collect::<Result<_>>()?,
             team: project.team,
             sections,
-            layout: layout_for_data(project.layout),
+            layout: layout_for_data(project.layout)?,
             causas_raiz,
             plan_remediacion,
         },
@@ -523,9 +527,67 @@ fn prepare_build(
     Ok((build_dir, report_typ))
 }
 
+/// Variables de entorno que hereda Typst. Todo lo demas se descarta (por
+/// ejemplo `PUDUREPORT_SERVICE_KEY` del servicio): Typst solo necesita
+/// encontrar fuentes y un temporal. En Windows se conservan las variables del
+/// sistema sin las que un proceso no arranca bien ni encuentra las fuentes.
+const TYPST_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TYPST_FONT_PATHS",
+    "SOURCE_DATE_EPOCH",
+    "XDG_DATA_HOME",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "FONTCONFIG_FILE",
+    "FONTCONFIG_PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "USERPROFILE",
+];
+
+/// Filtra un entorno a las variables de `TYPST_ENV_ALLOWLIST`.
+fn typst_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| {
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            TYPST_ENV_ALLOWLIST.iter().any(|allowed| {
+                // En Windows los nombres de variables no distinguen mayusculas.
+                if cfg!(windows) {
+                    allowed.eq_ignore_ascii_case(name)
+                } else {
+                    *allowed == name
+                }
+            })
+        })
+        .collect()
+}
+
+/// Comando para ejecutar Typst con el entorno vacio salvo
+/// `TYPST_ENV_ALLOWLIST`, para que ningun secreto del proceso padre (como la
+/// clave del servicio) llegue al proceso hijo.
+pub fn typst_command(typst_bin: &Path) -> Command {
+    let mut cmd = Command::new(typst_bin);
+    cmd.env_clear().envs(typst_env(std::env::vars_os()));
+    cmd
+}
+
 /// Ejecuta `typst compile` mapeando el error de binario ausente. Con
-/// `timeout`, mata el proceso si no termina a tiempo (lo usa el servicio; la
-/// app de escritorio no pone limite).
+/// `timeout`, mata el proceso si no termina a tiempo, y con `jobs` limita los
+/// hilos de Typst (los usa el servicio; la app de escritorio no pone limite).
 fn run_typst(
     typst_bin: &Path,
     root: &Path,
@@ -533,8 +595,9 @@ fn run_typst(
     out: &Path,
     ppi: Option<u32>,
     timeout: Option<Duration>,
+    jobs: Option<u32>,
 ) -> Result<()> {
-    let mut cmd = Command::new(typst_bin);
+    let mut cmd = typst_command(typst_bin);
     // En Windows, spawnear el sidecar abre una consola que parpadea en cada
     // compilacion; CREATE_NO_WINDOW la suprime. No-op en otras plataformas.
     #[cfg(windows)]
@@ -543,6 +606,9 @@ fn run_typst(
         cmd.creation_flags(0x0800_0000);
     }
     cmd.arg("compile").arg("--root").arg(root);
+    if let Some(jobs) = jobs {
+        cmd.arg("--jobs").arg(jobs.max(1).to_string());
+    }
     if let Some(ppi) = ppi {
         cmd.arg("--format")
             .arg("png")
@@ -661,7 +727,7 @@ pub fn generate_pdf(
     let template = effective_template(&project);
     let (build_dir, report_typ) = prepare_build(root, project_id, templates_dir, &template)?;
     let primary = build_dir.join(report_filename(&project));
-    run_typst(typst_bin, root, &report_typ, &primary, None, None)?;
+    run_typst(typst_bin, root, &report_typ, &primary, None, None, None)?;
     let mut out = vec![primary];
 
     if also_executive && template != "ejecutivo" {
@@ -673,7 +739,7 @@ pub fn generate_pdf(
             "{}-ejecutivo.pdf",
             naming::standard_basename(&project)
         ));
-        run_typst(typst_bin, root, &exec_typ, &exec_pdf, None, None)?;
+        run_typst(typst_bin, root, &exec_typ, &exec_pdf, None, None, None)?;
         out.push(exec_pdf);
     }
     Ok(out)
@@ -751,6 +817,9 @@ pub struct RenderOptions {
     pub template: Option<String>,
     /// Tiempo maximo de Typst; al vencer se mata el proceso.
     pub timeout: Option<Duration>,
+    /// Hilos de Typst (`--jobs`). `None` usa el defecto de Typst (un hilo
+    /// por CPU).
+    pub jobs: Option<u32>,
 }
 
 /// PDF generado por `render_bundled`.
@@ -779,7 +848,15 @@ pub fn render_bundled(
     with_bundled_templates(|templates| {
         let (build_dir, report_typ) = prepare_build(root, project_id, templates, &template)?;
         let path = build_dir.join(report_filename(&project));
-        run_typst(typst_bin, root, &report_typ, &path, None, options.timeout)?;
+        run_typst(
+            typst_bin,
+            root,
+            &report_typ,
+            &path,
+            None,
+            options.timeout,
+            options.jobs,
+        )?;
         Ok(RenderedPdf {
             path,
             template: template.clone(),
@@ -813,7 +890,15 @@ pub fn preview_pdf(
 
     // Typst sustituye {p} por el numero de pagina (1-based).
     let pattern = preview_dir.join("page-{0p}.png");
-    run_typst(typst_bin, root, &report_typ, &pattern, Some(120), None)?;
+    run_typst(
+        typst_bin,
+        root,
+        &report_typ,
+        &pattern,
+        Some(120),
+        None,
+        None,
+    )?;
 
     // Recolectar las paginas en orden.
     let mut pages: Vec<PathBuf> = std::fs::read_dir(&preview_dir)?
@@ -1048,11 +1133,105 @@ mod tests {
             &dir.join("out.pdf"),
             None,
             Some(Duration::from_millis(300)),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, PdfError::Timeout(_)), "{err}");
         assert!(started.elapsed() < Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typst_env_keeps_only_the_allowlist() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/pudu"),
+            ("TYPST_FONT_PATHS", "/fuentes"),
+            ("PUDUREPORT_SERVICE_KEY", "secreto"),
+            ("PUDUREPORT_SERVICE_KEY_FILE", "/run/secrets/clave"),
+            ("AWS_SECRET_ACCESS_KEY", "otro"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let mut kept: Vec<String> = typst_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["HOME", "PATH", "TYPST_FONT_PATHS"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_typst_clears_env_and_passes_jobs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Un "typst" falso que vuelca su entorno y sus argumentos.
+        let dir = std::env::temp_dir().join(format!("pudu-typst-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("typst");
+        let script = format!(
+            "#!/bin/sh\n/usr/bin/env > '{0}/env.txt'\necho \"$@\" > '{0}/args.txt'\n",
+            dir.display()
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_typst(
+            &fake,
+            &dir,
+            &dir.join("report.typ"),
+            &dir.join("out.pdf"),
+            None,
+            Some(Duration::from_secs(20)),
+            Some(1),
+        )
+        .unwrap();
+        let env = std::fs::read_to_string(dir.join("env.txt")).unwrap();
+        // Variables que agrega el propio shell, no el proceso padre.
+        let shell = ["PWD", "OLDPWD", "SHLVL", "_"];
+        for line in env.lines() {
+            let name = line.split('=').next().unwrap_or_default();
+            assert!(
+                TYPST_ENV_ALLOWLIST.contains(&name) || shell.contains(&name),
+                "variable heredada fuera de la lista: {name}"
+            );
+        }
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert!(args.contains("--jobs 1"), "{args}");
+
+        // Sin `jobs` (app de escritorio) no se agrega el argumento.
+        run_typst(
+            &fake,
+            &dir,
+            &dir.join("report.typ"),
+            &dir.join("out.pdf"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert!(!args.contains("--jobs"), "{args}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_data_rejects_amplified_markdown() {
+        let tmp = std::env::temp_dir().join(format!("pudu-pdf-md-{}", uuid::Uuid::new_v4()));
+        workspace::create_workspace(&tmp, "WS").unwrap();
+        let (pid, _) = workspace::create_project(&tmp, "Web", "ACME", "pentest").unwrap();
+        let mut finding = workspace::create_finding(&tmp, &pid, "Tabla").unwrap();
+        finding.body = format!(
+            "{}|\n{}|\n{}",
+            "|a".repeat(5_000),
+            "|-".repeat(5_000),
+            "x\n".repeat(5_000)
+        );
+        workspace::write_finding(&tmp, &pid, &finding).unwrap();
+        let err = build_data(&tmp, &pid).err().expect("debia fallar");
+        assert!(matches!(err, PdfError::Markdown(_)), "{err}");
+        assert!(err.to_string().contains("demasiado markup"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1063,7 +1242,7 @@ mod tests {
         for bad in ["../pentest", "theme", "no-existe"] {
             let options = RenderOptions {
                 template: Some(bad.to_string()),
-                timeout: None,
+                ..Default::default()
             };
             let err = render_bundled(&tmp, &pid, Path::new("typst"), &options).unwrap_err();
             assert!(matches!(err, PdfError::TemplateNotFound(_)), "{bad}: {err}");

@@ -132,6 +132,15 @@ informe nuevo abre en la web igual que un proyecto nuevo de escritorio.
 - CSP sin `unsafe-eval`: `default-src 'self'`, imagenes `self data: blob:`,
   `connect-src 'self'`, `object-src 'none'`. El servidor que aloja el editor
   deberia enviar la misma politica como cabecera.
+- Imagenes del Markdown: en la vista visual solo se cargan evidencias del
+  paquete (`assets/...`, via `GET /{id}/assets/...`). Cualquier otra `src`
+  (`https:`, `http:`, `data:`, incluido SVG, `blob:` o rutas fuera de
+  `assets/`) se muestra como "Imagen externa no permitida" y el Markdown
+  conserva la ruta tal cual. Un informe compartido no puede hacer que el
+  navegador de quien lo edita pida recursos a terceros. Es defensa en
+  profundidad: la CSP de `/editor/` en PuduHub ya restringe `img-src` a
+  `'self' data: blob:`. En escritorio no cambia (la CSP de la ventana ya
+  bloquea las imagenes remotas).
 - `npm run build` (escritorio) no cambia.
 
 ```sh
@@ -232,6 +241,19 @@ la imagen. En resumen:
 - Cada render importa el paquete en un temporal propio que se borra siempre,
   con limite de tamano, de tiempo (Typst se mata al vencer) y de concurrencia
   (`503 busy`).
+- El cupo de concurrencia se toma antes de leer el cuerpo: un
+  `Content-Length` mayor al limite se rechaza (`413`) sin leerlo, un cuerpo
+  sin `Content-Length` (`chunked`) se corta apenas supera el limite y una
+  subida que no termina a tiempo recibe `408 upload_timeout`. Asi N subidas
+  simultaneas no retienen N veces el tamano maximo en memoria.
+- La conversion de Markdown a Typst acota el anidamiento (16 niveles de
+  listas, citas y negrita/cursiva) y el tamano de la salida
+  (`max(8 x entrada, 1 MiB)`, nunca mas de 64 MiB por texto); si se supera,
+  el render falla con `422 render_failed` antes de llegar a Typst.
+- Typst corre con el entorno vacio salvo `PATH`, `HOME`, `TMPDIR`, el idioma
+  y las variables de fuentes (`TYPST_FONT_PATHS`, XDG, fontconfig): la clave
+  del servicio y cualquier otra variable no llegan al proceso hijo. En el
+  servicio corre con `--jobs 1`.
 - Registros JSON por linea con metodo, ruta, estado, duracion, tamanos y
   plantilla; nunca contenido ni detalles de error que puedan citarlo.
 - Cabeceras de version: servicio, huella de plantillas y Typst.
@@ -246,7 +268,10 @@ la imagen. En resumen:
   guardado sin descartar lo que hay en pantalla.
 - El servicio no hace llamadas de red: el contenido se escapa al convertirlo a
   Typst (no puede importar paquetes) y la imagen debe correr sin salida a
-  Internet. Typst solo lee dentro del temporal del trabajo (`--root`).
+  Internet. Typst solo lee dentro del temporal del trabajo (`--root`) y no
+  hereda el entorno del servicio.
+- Contenedor: limitar memoria y procesos (el compose de PuduHub usa 1 GiB y
+  256 pids con `PUDUREPORT_SERVICE_CONCURRENCY=2`). Ver service/README.md.
 - El paquete se valida completo antes de escribir; ver la lista de arriba.
 
 ## Exportacion a API: `uid`

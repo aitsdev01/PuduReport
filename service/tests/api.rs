@@ -6,8 +6,13 @@
 
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use pudureport_core::package::{self, PackageInfo};
@@ -186,6 +191,159 @@ async fn enforces_body_size_limit() {
     let (status, _, body) = send(app(cfg), render_request(vec![0u8; 4096], Some(KEY))).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(json(&body)["error"], "payload_too_large");
+}
+
+/// Cuerpo que nunca entrega datos y cuenta cuantas veces se lo leyo.
+struct PendingBody(Arc<AtomicUsize>);
+
+impl http_body::Body for PendingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
+/// Cuerpo sin fin (como un `chunked` que nunca termina), en trozos de 64 KiB.
+struct EndlessBody(Arc<AtomicUsize>);
+
+impl http_body::Body for EndlessBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        self.0.fetch_add(64 * 1024, Ordering::SeqCst);
+        Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![
+            0u8;
+            64 * 1024
+        ])))))
+    }
+}
+
+/// Envia con un tope de tiempo: una peticion que lee un cuerpo pendiente
+/// quedaria colgada.
+async fn send_quick(
+    app: axum::Router,
+    req: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    tokio::time::timeout(Duration::from_secs(10), send(app, req))
+        .await
+        .expect("la respuesta no debio esperar al cuerpo")
+}
+
+#[tokio::test]
+async fn rejects_declared_length_over_limit_without_reading_body() {
+    let mut cfg = config();
+    cfg.max_body_bytes = 1024;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let req = Request::post("/v1/render")
+        .header("content-type", "application/zip")
+        .header("content-length", "4096")
+        .header(KEY_HEADER, KEY)
+        .body(Body::new(PendingBody(polls.clone())))
+        .unwrap();
+    let (status, _, body) = send_quick(app(cfg), req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(json(&body)["error"], "payload_too_large");
+    assert_eq!(polls.load(Ordering::SeqCst), 0, "no debio leer el cuerpo");
+}
+
+#[tokio::test]
+async fn caps_body_without_content_length_while_streaming() {
+    let mut cfg = config();
+    cfg.max_body_bytes = 1024 * 1024;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let req = Request::post("/v1/render")
+        .header("content-type", "application/zip")
+        .header(KEY_HEADER, KEY)
+        .body(Body::new(EndlessBody(sent.clone())))
+        .unwrap();
+    let (status, _, body) = send_quick(app(cfg), req).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(json(&body)["error"], "payload_too_large");
+    // Corta apenas pasa el limite, sin seguir leyendo.
+    assert!(sent.load(Ordering::SeqCst) <= 2 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn upload_that_never_finishes_times_out() {
+    let mut cfg = config();
+    cfg.upload_timeout = Duration::from_millis(200);
+    let req = Request::post("/v1/render")
+        .header("content-type", "application/zip")
+        .header(KEY_HEADER, KEY)
+        .body(Body::new(PendingBody(Arc::new(AtomicUsize::new(0)))))
+        .unwrap();
+    let (status, _, body) = send_quick(app(cfg), req).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(json(&body)["error"], "upload_timeout");
+}
+
+/// Typst falso que avisa que arranco (`iniciado`), espera el archivo
+/// `seguir` y escribe un PDF minimo en la salida (ultimo argumento).
+#[cfg(unix)]
+fn blocking_fake_typst(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = dir.join("typst");
+    let script = format!(
+        "#!/bin/sh\ntouch '{0}/iniciado'\nwhile [ ! -f '{0}/seguir' ]; do sleep 0.05; done\nfor last; do :; done\nprintf '%%PDF-1.7 falso' > \"$last\"\n",
+        dir.display()
+    );
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn busy_is_answered_before_reading_the_body() {
+    let dir = std::env::temp_dir().join(format!("pudu-svc-ocupado-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = blocking_fake_typst(&dir);
+    let mut cfg = Config::new(&[KEY.to_string()], fake, "typst falso".to_string());
+    cfg.concurrency = 1;
+    let router = app(cfg);
+
+    // El primer render toma el unico cupo y queda esperando en Typst.
+    let first = tokio::spawn(send(
+        router.clone(),
+        render_request(example_package(), Some(KEY)),
+    ));
+    let started = Instant::now();
+    while !dir.join("iniciado").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "Typst no arranco"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // El segundo recibe 503 sin que se lea su cuerpo.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let req = Request::post("/v1/render")
+        .header("content-type", "application/zip")
+        .header(KEY_HEADER, KEY)
+        .body(Body::new(PendingBody(polls.clone())))
+        .unwrap();
+    let (status, headers, body) = send_quick(router.clone(), req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json(&body)["error"], "busy");
+    assert_eq!(headers["retry-after"], "2");
+    assert_eq!(polls.load(Ordering::SeqCst), 0, "no debio leer el cuerpo");
+
+    std::fs::write(dir.join("seguir"), b"").unwrap();
+    let (status, _, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(body.starts_with(b"%PDF"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

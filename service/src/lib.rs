@@ -20,13 +20,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::rejection::{BytesRejection, JsonRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use pudureport_core::models::{CvssVersion, PROJECT_TYPES};
 use pudureport_core::package::{self, ImportOptions, PackageError, PackageLimits};
 use pudureport_core::pdf::{self, PdfError, RenderOptions};
@@ -63,6 +64,9 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Tiempo maximo de Typst por render.
     pub render_timeout: Duration,
+    /// Tiempo maximo para recibir el cuerpo de `/v1/render` (el cupo de
+    /// concurrencia se toma antes de leerlo).
+    pub upload_timeout: Duration,
     /// Renders simultaneos; el resto recibe 503.
     pub concurrency: usize,
     /// Directorio base de los temporales por trabajo.
@@ -78,6 +82,7 @@ impl std::fmt::Debug for Config {
             .field("typst_version", &self.typst_version)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("render_timeout", &self.render_timeout)
+            .field("upload_timeout", &self.upload_timeout)
             .field("concurrency", &self.concurrency)
             .field("temp_dir", &self.temp_dir)
             .finish()
@@ -117,6 +122,7 @@ impl Config {
             typst_version,
             max_body_bytes: 200 * MIB,
             render_timeout: Duration::from_secs(60),
+            upload_timeout: Duration::from_secs(120),
             concurrency: 2,
             temp_dir: std::env::temp_dir(),
         }
@@ -130,6 +136,7 @@ impl Config {
     /// - `PUDUREPORT_SERVICE_KEY`: la clave en una variable (alternativa).
     /// - `PUDU_TYPST_BIN`: ruta del binario de Typst.
     /// - `PUDUREPORT_SERVICE_MAX_BYTES`, `PUDUREPORT_SERVICE_TIMEOUT_SECS`,
+    ///   `PUDUREPORT_SERVICE_UPLOAD_TIMEOUT_SECS`,
     ///   `PUDUREPORT_SERVICE_CONCURRENCY`, `PUDUREPORT_SERVICE_TMPDIR`.
     pub fn from_env() -> Result<Self, String> {
         let text = match std::env::var("PUDUREPORT_SERVICE_KEY_FILE") {
@@ -146,6 +153,9 @@ impl Config {
         }
         if let Some(v) = env_number("PUDUREPORT_SERVICE_TIMEOUT_SECS")? {
             cfg.render_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = env_number("PUDUREPORT_SERVICE_UPLOAD_TIMEOUT_SECS")? {
+            cfg.upload_timeout = Duration::from_secs(v.max(1));
         }
         if let Some(v) = env_number("PUDUREPORT_SERVICE_CONCURRENCY")? {
             cfg.concurrency = (v as usize).max(1);
@@ -186,9 +196,10 @@ fn env_number(name: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// Ejecuta `typst --version`; ademas confirma que el binario funciona.
+/// Ejecuta `typst --version`; ademas confirma que el binario funciona. Como
+/// en cada render, Typst corre sin heredar el entorno del servicio.
 pub fn typst_version(bin: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(bin)
+    let output = pdf::typst_command(bin)
         .arg("--version")
         .output()
         .map_err(|e| format!("no se pudo ejecutar Typst ({}): {e}", bin.display()))?;
@@ -246,7 +257,9 @@ impl AppState {
 
 /// Router completo del servicio.
 pub fn router(state: AppState) -> Router {
-    let render = post(render).layer(DefaultBodyLimit::max(state.cfg.max_body_bytes));
+    // El cuerpo de `/v1/render` lo lee el propio manejador (con su limite)
+    // despues de tomar el cupo de concurrencia.
+    let render = post(render).layer(DefaultBodyLimit::disable());
     let cvss = post(cvss_handler).layer(DefaultBodyLimit::max(16 * 1024));
     let initial = post(initial_project).layer(DefaultBodyLimit::max(16 * 1024));
     let protected = Router::new()
@@ -499,7 +512,9 @@ impl From<PdfError> for RenderFailure {
                 code: "unknown_template",
                 detalle: Some(e.to_string()),
             },
-            PdfError::Compile(_) => RenderFailure {
+            // Markdown que se amplifica demasiado al convertirlo: mismo codigo
+            // que un error de compilacion (el detalle no cita contenido).
+            PdfError::Compile(_) | PdfError::Markdown(_) => RenderFailure {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "render_failed",
                 detalle: Some(e.to_string()),
@@ -556,6 +571,9 @@ fn render_package(
         &RenderOptions {
             template,
             timeout: Some(cfg.render_timeout),
+            // Un hilo por render: la concurrencia ya la acota el semaforo y
+            // asi el uso de CPU y memoria es predecible por contenedor.
+            jobs: Some(1),
         },
     )?;
     let pdf = std::fs::read(&rendered.path).map_err(|_| internal())?;
@@ -586,11 +604,41 @@ fn accepted_content_type(headers: &HeaderMap) -> bool {
     )
 }
 
+/// Largo declarado en `Content-Length`, si viene y es valido.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Falla al leer el cuerpo de un render.
+enum BodyFailure {
+    TooLarge,
+    Timeout,
+    Invalid,
+}
+
+/// Lee el cuerpo completo cortando apenas supera `max` bytes (tambien sin
+/// `Content-Length`, por ejemplo con `Transfer-Encoding: chunked`) o si no
+/// termina de llegar a tiempo.
+async fn read_body(body: Body, max: usize, timeout: Duration) -> Result<Bytes, BodyFailure> {
+    match tokio::time::timeout(timeout, Limited::new(body, max).collect()).await {
+        Err(_) => Err(BodyFailure::Timeout),
+        Ok(Ok(collected)) => Ok(collected.to_bytes()),
+        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => Err(BodyFailure::TooLarge),
+        Ok(Err(_)) => Err(BodyFailure::Invalid),
+    }
+}
+
 async fn render(
     State(state): State<AppState>,
     query: Result<Query<RenderQuery>, QueryRejection>,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Response {
     let started = Instant::now();
     let Ok(Query(query)) = query else {
@@ -603,25 +651,34 @@ async fn render(
             None,
         );
     }
-    let body = match body {
-        Ok(body) => body,
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", None)
-        }
-        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_body", None),
-    };
+    // Un largo declarado mayor al limite se rechaza sin leer el cuerpo.
+    if declared_length(&headers).is_some_and(|n| n > state.cfg.max_body_bytes as u64) {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", None);
+    }
     let template = query.plantilla.filter(|t| !t.is_empty());
     if let Some(name) = &template {
         if !pdf::bundled_template_names().contains(&name.as_str()) {
             return error(StatusCode::UNPROCESSABLE_ENTITY, "unknown_template", None);
         }
     }
+    // El cupo se toma antes de leer el cuerpo: asi N subidas simultaneas no
+    // pueden retener N veces el tamano maximo en memoria.
     let Ok(permit) = state.permits.clone().try_acquire_owned() else {
         let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "busy", None);
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
         return response;
+    };
+    let body = match read_body(body, state.cfg.max_body_bytes, state.cfg.upload_timeout).await {
+        Ok(body) => body,
+        Err(BodyFailure::TooLarge) => {
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", None)
+        }
+        Err(BodyFailure::Timeout) => {
+            return error(StatusCode::REQUEST_TIMEOUT, "upload_timeout", None)
+        }
+        Err(BodyFailure::Invalid) => return error(StatusCode::BAD_REQUEST, "invalid_body", None),
     };
 
     let cfg = state.cfg.clone();

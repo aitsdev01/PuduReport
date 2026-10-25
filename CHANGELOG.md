@@ -23,6 +23,16 @@ Todo cambio notable se documenta en este archivo. El formato sigue Keep a Change
 ### Changed
 - El pipeline de PDF del core admite un limite de tiempo (mata a Typst al vencer) y un render con las plantillas incluidas y plantilla opcional; la app de escritorio no usa limite.
 - `pudureport-core` declara `rust-version = "1.88"` (lo exige `zip`).
+- Typst se ejecuta con el entorno vacio salvo las variables que necesita (`PATH`, `HOME`, temporal, idioma, fuentes y, en Windows, las del sistema), en la app y en el servicio.
+
+### Fixed
+- Una lista anidada dentro de un item sin parrafo quedaba en la misma linea que el texto del item padre (`- a  - b`) y Typst la mostraba como un solo item. Ahora cada nivel va en su propia linea.
+
+### Security
+- Conversion de Markdown a Typst con memoria acotada: la sangria de listas anidadas era cuadratica (32 KB de `- - - ...` generaban 256 MB antes de llegar a Typst). Ahora el anidamiento de listas, citas y negrita/cursiva se refleja hasta 16 niveles y la salida de cada texto no puede superar `max(8 x entrada, 1 MiB)` (64 MiB como maximo); si se supera, la exportacion falla con un error claro. El tope se controla mientras se genera, asi que tambien cubre tablas con muchas columnas y filas cortas o referencias de enlace repetidas.
+- `pudureport-service` toma el cupo de concurrencia antes de leer el cuerpo de `/v1/render`, rechaza con `413` un `Content-Length` mayor al limite sin leerlo, corta un cuerpo sin `Content-Length` apenas supera el limite y responde `408 upload_timeout` si la subida no termina a tiempo (`PUDUREPORT_SERVICE_UPLOAD_TIMEOUT_SECS`, 120 s por defecto).
+- La clave del servicio y el resto de su entorno ya no llegan al proceso de Typst, que en el servicio corre con `--jobs 1`. `service/README.md` documenta los limites recomendados del contenedor (1 GiB de memoria y 256 procesos).
+- El editor web solo carga en la vista visual las evidencias del paquete (`assets/...`); las imagenes externas o `data:` (incluido SVG) se muestran como "Imagen externa no permitida". Es defensa en profundidad sobre la CSP de `/editor/`. La app de escritorio no cambia.
 
 ### Security
 - La exportacion CSV neutraliza la inyeccion de formulas: toda celda cuyo primer caracter no blanco sea `=`, `+`, `-` o `@`, o que empiece con tabulador o retorno de carro, se exporta con una comilla simple delante para que Excel, LibreOffice o Google Sheets la muestren como texto. Aplica a todas las columnas, incluidas las de texto libre `modulo`, `impacto_negocio` y `causa_raiz`; el entrecomillado RFC 4180 se aplica despues. Los valores CVSS (ej. `9.8`) no cambian; un numero negativo, que hoy ninguna columna produce, se exportaria como texto.

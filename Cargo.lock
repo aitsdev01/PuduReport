@@ -2689,6 +2689,7 @@ name = "pudureport-service"
 version = "0.0.25"
 dependencies = [
  "axum",
+ "http-body",
  "http-body-util",
  "pudureport-core",
  "serde",

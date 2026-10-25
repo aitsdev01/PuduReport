@@ -959,6 +959,21 @@ i.ti {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* Imagen que el editor web no carga (no es una evidencia del paquete). */
+.ProseMirror .md-image-blocked {
+  display: inline-block;
+  margin: 6px 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-style: italic;
+}
+.ProseMirror .md-image-blocked.ProseMirror-selectednode {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .md-sep {
   width: 1px;
   align-self: stretch;
