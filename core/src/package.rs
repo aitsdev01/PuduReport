@@ -34,6 +34,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use crate::models::{ProjectMeta, WorkspaceMeta};
 use crate::workspace;
+use crate::yaml_guard::YamlBudget;
 
 /// Version del formato de paquete que produce y acepta esta version.
 pub const FORMAT_VERSION: u32 = 1;
@@ -68,6 +69,22 @@ pub enum PackageError {
 
 type Result<T> = std::result::Result<T, PackageError>;
 
+// Limites de seguridad compartidos con el importador de PuduHub
+// (`informes/paquete.py`, `limits.py` y `documento.py`): ambos lados aceptan
+// el mismo conjunto de paquetes.
+
+/// Sobre 64 KiB, una entrada puede expandirse a lo mas 200 veces.
+const RATIO_THRESHOLD_BYTES: u64 = 64 * 1024;
+const MAX_RATIO: u64 = 200;
+/// Sobre 1 MiB de contenido, el paquete completo a lo mas 50 veces su tamano.
+const ARCHIVE_RATIO_THRESHOLD_BYTES: u64 = 1024 * 1024;
+const MAX_ARCHIVE_RATIO: u64 = 50;
+/// Front-matter de un hallazgo (bytes UTF-8), revisado antes de parsear el YAML.
+const MAX_FRONT_MATTER_BYTES: usize = 128 * 1024;
+/// Lado y area maximos que puede declarar una imagen.
+const MAX_IMAGE_SIDE: u64 = 20_000;
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
 fn invalid(msg: impl Into<String>) -> PackageError {
     PackageError::Invalid(msg.into())
 }
@@ -90,6 +107,10 @@ pub struct PackageLimits {
     pub max_workspace_bytes: u64,
     pub max_finding_bytes: u64,
     pub max_asset_bytes: u64,
+    /// Suma maxima de las entradas de texto (manifiesto, `project.yaml`,
+    /// `workspace.yaml` y `findings/*.md`): lo que cabe en un documento
+    /// guardado de PuduHub.
+    pub max_text_bytes: u64,
 }
 
 impl Default for PackageLimits {
@@ -105,6 +126,7 @@ impl Default for PackageLimits {
             max_workspace_bytes: MIB,
             max_finding_bytes: 512 * 1024,
             max_asset_bytes: 10 * MIB,
+            max_text_bytes: 48 * MIB,
         }
     }
 }
@@ -272,6 +294,201 @@ fn allowed_dir(name: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Dimensiones declaradas de las imagenes
+// ---------------------------------------------------------------------------
+
+/// Pasos maximos al recorrer la estructura de una imagen (chunks, segmentos,
+/// sub-bloques). Una imagen legitima de 10 MiB usa unas decenas de miles.
+const MAX_IMAGE_STEPS: u32 = 200_000;
+
+/// Marcadores SOF0..SOF15 de JPEG salvo DHT (C4), JPG (C8) y DAC (CC).
+fn jpeg_sof(marker: u8) -> bool {
+    (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
+}
+
+fn be16(data: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_be_bytes([data[at], data[at + 1]]))
+}
+
+fn le16(data: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([data[at], data[at + 1]]))
+}
+
+fn le24(data: &[u8], at: usize) -> u64 {
+    u64::from(data[at]) | u64::from(data[at + 1]) << 8 | u64::from(data[at + 2]) << 16
+}
+
+fn le32(data: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([
+        data[at],
+        data[at + 1],
+        data[at + 2],
+        data[at + 3],
+    ]))
+}
+
+/// Contador de pasos: `None` cuando la estructura es demasiado compleja.
+fn step(count: &mut u32) -> Option<()> {
+    if *count >= MAX_IMAGE_STEPS {
+        return None;
+    }
+    *count += 1;
+    Some(())
+}
+
+fn png_sizes(data: &[u8]) -> Vec<(u64, u64)> {
+    if data.len() < 24 || &data[12..16] != b"IHDR" {
+        return Vec::new();
+    }
+    let width = u64::from(u32::from_be_bytes([data[16], data[17], data[18], data[19]]));
+    let height = u64::from(u32::from_be_bytes([data[20], data[21], data[22], data[23]]));
+    vec![(width, height)]
+}
+
+fn gif_sizes(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    if data.len() < 10 {
+        return Some(Vec::new());
+    }
+    let mut sizes = vec![(le16(data, 6), le16(data, 8))];
+    let Some(&flags) = data.get(10) else {
+        return Some(sizes);
+    };
+    let color_table = |flags: u8| {
+        if flags & 0x80 != 0 {
+            3usize << ((flags & 0x07) + 1)
+        } else {
+            0
+        }
+    };
+    let mut offset = 13 + color_table(flags);
+    let mut steps = 0;
+    while offset < data.len() {
+        step(&mut steps)?;
+        match data[offset] {
+            0x3B => break,
+            0x21 => offset += 2,
+            0x2C => {
+                if offset + 10 > data.len() {
+                    break;
+                }
+                sizes.push((le16(data, offset + 5), le16(data, offset + 7)));
+                offset += 10 + color_table(data[offset + 9]) + 1;
+            }
+            _ => break,
+        }
+        while offset < data.len() && data[offset] != 0 {
+            step(&mut steps)?;
+            offset += usize::from(data[offset]) + 1;
+        }
+        offset += 1;
+    }
+    Some(sizes)
+}
+
+fn jpeg_sizes(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let mut sizes = Vec::new();
+    let mut offset = 2;
+    let mut steps = 0;
+    while let Some(found) = data
+        .get(offset..)
+        .and_then(|rest| rest.iter().position(|&b| b == 0xFF))
+    {
+        offset += found;
+        if offset + 1 >= data.len() {
+            break;
+        }
+        step(&mut steps)?;
+        let marker = data[offset + 1];
+        // Relleno, 0xFF00 y marcadores sin largo (TEM, RST0-7): como libjpeg,
+        // se salta lo que haya entre segmentos.
+        if matches!(marker, 0x00 | 0x01 | 0xFF) || (0xD0..=0xD7).contains(&marker) {
+            offset += if marker == 0xFF { 1 } else { 2 };
+            continue;
+        }
+        if marker == 0xD9 || offset + 4 > data.len() {
+            break;
+        }
+        let length = be16(data, offset + 2) as usize;
+        if length < 2 {
+            break;
+        }
+        if jpeg_sof(marker) && offset + 9 <= data.len() {
+            sizes.push((be16(data, offset + 7), be16(data, offset + 5)));
+        }
+        offset += 2 + length;
+    }
+    Some(sizes)
+}
+
+fn webp_sizes(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let mut sizes = Vec::new();
+    // (inicio, fin, dentro de un cuadro ANMF): los cuadros se recorren una vez.
+    let mut pending = vec![(12usize, data.len(), false)];
+    let mut steps = 0;
+    while let Some((mut offset, end, nested)) = pending.pop() {
+        while offset + 8 <= end {
+            step(&mut steps)?;
+            let kind = &data[offset..offset + 4];
+            let size = le32(data, offset + 4) as usize;
+            let start = offset + 8;
+            let payload = &data[start..start.saturating_add(size).min(end)];
+            match kind {
+                b"VP8X" if payload.len() >= 10 => {
+                    sizes.push((le24(payload, 4) + 1, le24(payload, 7) + 1));
+                }
+                b"VP8 " if payload.len() >= 10 && payload[3..6] == [0x9D, 0x01, 0x2A] => {
+                    sizes.push((le16(payload, 6) & 0x3FFF, le16(payload, 8) & 0x3FFF));
+                }
+                b"VP8L" if payload.len() >= 5 && payload[0] == 0x2F => {
+                    let bits = le32(payload, 1);
+                    sizes.push(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
+                }
+                b"ANMF" if !nested && payload.len() >= 16 => {
+                    sizes.push((le24(payload, 6) + 1, le24(payload, 9) + 1));
+                    pending.push((start + 16, start + payload.len(), true));
+                }
+                _ => {}
+            }
+            offset = start.saturating_add(size).saturating_add(size & 1);
+        }
+    }
+    Some(sizes)
+}
+
+/// Lienzo y cuadros que declara una imagen antes de sus pixeles (PNG IHDR,
+/// pantalla y cuadros GIF, SOFn de JPEG, VP8/VP8L/VP8X/ANMF de WebP). `None`
+/// si la estructura es demasiado compleja para recorrerla.
+fn declared_image_sizes(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some(png_sizes(data))
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        jpeg_sizes(data)
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        gif_sizes(data)
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        webp_sizes(data)
+    } else {
+        Some(Vec::new())
+    }
+}
+
+/// Los decodificadores reservan ancho x alto antes de leer pixeles: unos pocos
+/// bytes no pueden declarar un lienzo enorme (Typst del servicio es el blanco).
+fn check_image_dimensions(name: &str, data: &[u8]) -> Result<()> {
+    let sizes = declared_image_sizes(data)
+        .ok_or_else(|| invalid(format!("{name} tiene una estructura demasiado compleja")))?;
+    for (width, height) in sizes {
+        if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE || width * height > MAX_IMAGE_PIXELS {
+            return Err(invalid(format!(
+                "{name} declara {width}x{height} pixeles (maximo {MAX_IMAGE_SIDE} por lado y \
+                 {MAX_IMAGE_PIXELS} en total)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -370,6 +587,7 @@ pub fn export_package(
             let bytes = fs::read(entry.path())?;
             if !matches!(classify(&path), Ok(EntryKind::Asset))
                 || !workspace::is_raster_image(&bytes)
+                || check_image_dimensions(&path, &bytes).is_err()
             {
                 skipped.push(path);
                 continue;
@@ -391,7 +609,9 @@ pub fn export_package(
                         .ok()
                         .map(|b| (file, b))
                 })
-                .filter(|(_, b)| workspace::is_raster_image(b));
+                .filter(|(file, b)| {
+                    workspace::is_raster_image(b) && check_image_dimensions(file, b).is_ok()
+                });
             match bytes {
                 Some((file, b)) => {
                     branding.insert(format!("branding/{file}"), b);
@@ -497,13 +717,16 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
         )));
     }
 
+    // Primera pasada, solo encabezados (sin descomprimir): rutas, tipos,
+    // limites por entrada, razon de compresion y totales.
+    let archive_bytes = bytes.len() as u64;
     let mut seen: HashSet<String> = HashSet::new();
-    let mut contents: BTreeMap<String, (EntryKind, Vec<u8>)> = BTreeMap::new();
+    let mut entries: Vec<Option<(String, EntryKind, u64)>> = Vec::with_capacity(archive.len());
     let mut total: u64 = 0;
-
+    let mut text: u64 = 0;
     for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
+        let file = archive
+            .by_index_raw(index)
             .map_err(|e| invalid(format!("entrada ilegible: {e}")))?;
         let name = file
             .name()
@@ -527,6 +750,7 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
         }
         if file.is_dir() {
             if allowed_dir(&name) {
+                entries.push(None);
                 continue;
             }
             return Err(invalid(format!(
@@ -542,28 +766,62 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
             EntryKind::Finding(_) => limits.max_finding_bytes,
             EntryKind::Asset | EntryKind::Branding => limits.max_asset_bytes,
         };
-        // El tamano declarado puede mentir: se corta la lectura en el limite.
-        if file.size() > cap {
+        let size = file.size();
+        if size > cap {
             return Err(PackageError::TooLarge(format!(
-                "{name} declara {} bytes (maximo {cap})",
-                file.size()
+                "{name} declara {size} bytes (maximo {cap})"
             )));
         }
-        let mut data = Vec::new();
-        file.by_ref()
-            .take(cap + 1)
-            .read_to_end(&mut data)
-            .map_err(|e| invalid(format!("no se pudo descomprimir {name}: {e}")))?;
-        if data.len() as u64 > cap {
+        // El tamano comprimido declarado no puede superar el paquete (una
+        // mentira que esconderia la razon).
+        let compressed = file.compressed_size().min(archive_bytes).max(1);
+        if size > RATIO_THRESHOLD_BYTES && size > MAX_RATIO * compressed {
             return Err(PackageError::TooLarge(format!(
-                "{name} supera {cap} bytes descomprimido"
+                "{name} se expande mas de {MAX_RATIO} veces al descomprimir"
             )));
         }
-        total += data.len() as u64;
+        total += size;
         if total > limits.max_total_uncompressed {
             return Err(PackageError::TooLarge(format!(
                 "el contenido descomprimido supera {} bytes",
                 limits.max_total_uncompressed
+            )));
+        }
+        if !matches!(kind, EntryKind::Asset | EntryKind::Branding) {
+            text += size;
+            if text > limits.max_text_bytes {
+                return Err(PackageError::TooLarge(format!(
+                    "los archivos de texto superan {} bytes",
+                    limits.max_text_bytes
+                )));
+            }
+        }
+        entries.push(Some((name, kind, size)));
+    }
+    // Muchas entradas justo bajo la razon por entrada siguen siendo una bomba.
+    if total > ARCHIVE_RATIO_THRESHOLD_BYTES && total > MAX_ARCHIVE_RATIO * archive_bytes {
+        return Err(PackageError::TooLarge(format!(
+            "el paquete se expande mas de {MAX_ARCHIVE_RATIO} veces al descomprimir"
+        )));
+    }
+
+    // Segunda pasada: lectura acotada al tamano declarado (ya validado) mas un
+    // byte; si los bytes reales no coinciden, el encabezado mentia.
+    let mut contents: BTreeMap<String, (EntryKind, Vec<u8>)> = BTreeMap::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        let Some((name, kind, size)) = entry else {
+            continue;
+        };
+        let file = archive
+            .by_index(index)
+            .map_err(|e| invalid(format!("entrada ilegible: {e}")))?;
+        let mut data = Vec::with_capacity(size as usize);
+        file.take(size + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| invalid(format!("no se pudo descomprimir {name}: {e}")))?;
+        if data.len() as u64 != size {
+            return Err(invalid(format!(
+                "{name}: el tamano descomprimido no coincide con el declarado"
             )));
         }
         contents.insert(name, (kind, data));
@@ -610,6 +868,11 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
         .ok_or_else(|| invalid("falta project.yaml"))?;
     let project_text =
         std::str::from_utf8(&project_yaml).map_err(|_| invalid("project.yaml no es UTF-8"))?;
+    // Un solo presupuesto de YAML para project.yaml y todos los front-matter.
+    let mut yaml_budget = YamlBudget::default();
+    yaml_budget
+        .check(project_text)
+        .map_err(|e| invalid(format!("project.yaml invalido: {e}")))?;
     let mut meta: ProjectMeta = serde_yaml::from_str(project_text)
         .map_err(|e| invalid(format!("project.yaml invalido: {e}")))?;
     meta.reconcile_layout();
@@ -624,6 +887,16 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
             EntryKind::Finding(id) => {
                 let text = std::str::from_utf8(&data)
                     .map_err(|_| invalid(format!("{name} no es UTF-8")))?;
+                let (yaml, _) = workspace::split_front_matter(text, &id)
+                    .map_err(|e| invalid(format!("{name}: {e}")))?;
+                if yaml.len() > MAX_FRONT_MATTER_BYTES {
+                    return Err(PackageError::TooLarge(format!(
+                        "{name}: el front-matter supera {MAX_FRONT_MATTER_BYTES} bytes"
+                    )));
+                }
+                yaml_budget
+                    .check(&yaml)
+                    .map_err(|e| invalid(format!("{name}: {e}")))?;
                 workspace::parse_finding_document(&id, text)
                     .map_err(|e| invalid(format!("{name}: {e}")))?;
                 findings.push((id, data));
@@ -633,6 +906,7 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
                 if !workspace::is_raster_image(&data) {
                     return Err(invalid(format!("{name} no es una imagen valida")));
                 }
+                check_image_dimensions(&name, &data)?;
                 let file = name.rsplit('/').next().unwrap_or_default().to_string();
                 if kind == EntryKind::Asset {
                     assets.push((file, data));
@@ -643,6 +917,9 @@ pub fn validate_package(bytes: &[u8], limits: &PackageLimits) -> Result<Validate
             EntryKind::Workspace => {
                 let text = std::str::from_utf8(&data)
                     .map_err(|_| invalid("workspace.yaml no es UTF-8"))?;
+                YamlBudget::default()
+                    .check(text)
+                    .map_err(|e| invalid(format!("workspace.yaml invalido: {e}")))?;
                 let ws: WorkspaceMeta = serde_yaml::from_str(text)
                     .map_err(|e| invalid(format!("workspace.yaml invalido: {e}")))?;
                 workspace_meta = Some(portable_workspace(&ws));
@@ -794,8 +1071,16 @@ mod tests {
 
     /// Arma un ZIP a mano: (ruta, bytes) con manifiesto correcto opcional.
     fn build_zip(entries: &[(&str, &[u8])], with_manifest: bool) -> Vec<u8> {
+        build_zip_with(entries, with_manifest, CompressionMethod::Deflated)
+    }
+
+    fn build_zip_with(
+        entries: &[(&str, &[u8])],
+        with_manifest: bool,
+        method: CompressionMethod,
+    ) -> Vec<u8> {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let opts = SimpleFileOptions::default().compression_method(method);
         if with_manifest {
             let manifest = Manifest {
                 formato: 1,
@@ -1127,6 +1412,257 @@ mod tests {
             true,
         );
         assert!(err_of(&bytes).contains("archivo de marca invalido"));
+    }
+
+    /// Texto que casi no se comprime (hexadecimal pseudoaleatorio).
+    fn noise(len: usize) -> String {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(b"0123456789abcdef"[(state >> 60) as usize])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejects_entry_compression_ratio() {
+        let yaml = project_yaml();
+        // 300 KiB de ceros: bajo el limite del hallazgo, pero se expande miles
+        // de veces.
+        let mut finding = b"---\ntitle: x\n---\n".to_vec();
+        finding.extend_from_slice(&vec![b'a'; 300 * 1024]);
+        let bytes = build_zip(
+            &[("project.yaml", &yaml), ("findings/001-x.md", &finding)],
+            true,
+        );
+        let err = validate_package(&bytes, &PackageLimits::default()).unwrap_err();
+        assert!(matches!(err, PackageError::TooLarge(_)), "{err}");
+        assert!(err.to_string().contains("200 veces"), "{err}");
+    }
+
+    #[test]
+    fn rejects_archive_compression_ratio() {
+        let yaml = project_yaml();
+        // Cada hallazgo queda bajo 64 KiB (sin razon por entrada), pero el
+        // paquete completo se expande mas de 50 veces.
+        let mut finding = b"---\ntitle: x\n---\n".to_vec();
+        finding.extend_from_slice(&vec![b'a'; 60 * 1024]);
+        let names: Vec<String> = (0..40).map(|i| format!("findings/{i:03}-x.md")).collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("project.yaml", &yaml)];
+        entries.extend(names.iter().map(|n| (n.as_str(), finding.as_slice())));
+        let bytes = build_zip(&entries, true);
+        let err = validate_package(&bytes, &PackageLimits::default()).unwrap_err();
+        assert!(matches!(err, PackageError::TooLarge(_)), "{err}");
+        assert!(err.to_string().contains("50 veces"), "{err}");
+    }
+
+    /// Cambia el tamano descomprimido declarado de `name` en sus encabezados
+    /// local y central.
+    fn patch_declared_size(zip: &mut [u8], name: &str, size: u32) {
+        let mut patched = 0;
+        for at in 0..zip.len().saturating_sub(46) {
+            // (inicio del nombre, tamano descomprimido, largo del nombre).
+            let (name_at, size_at, len_at) = match zip[at..at + 4] {
+                [0x50, 0x4B, 0x03, 0x04] => (30, 22, 26),
+                [0x50, 0x4B, 0x01, 0x02] => (46, 24, 28),
+                _ => continue,
+            };
+            let len = u16::from_le_bytes([zip[at + len_at], zip[at + len_at + 1]]) as usize;
+            if zip.get(at + name_at..at + name_at + len) == Some(name.as_bytes()) {
+                zip[at + size_at..at + size_at + 4].copy_from_slice(&size.to_le_bytes());
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 2);
+    }
+
+    #[test]
+    fn lying_size_header_cannot_over_read() {
+        let yaml = project_yaml();
+        let stored = build_zip_with(&[("project.yaml", &yaml)], true, CompressionMethod::Stored);
+        // Declara menos de lo que trae: la lectura se corta en lo declarado + 1.
+        let mut bytes = stored.clone();
+        patch_declared_size(&mut bytes, "project.yaml", 4);
+        let err = err_of(&bytes);
+        assert!(
+            err.starts_with("paquete invalido") && err.contains("project.yaml"),
+            "{err}"
+        );
+        // Declara mas de lo que trae.
+        let mut bytes = stored;
+        patch_declared_size(&mut bytes, "project.yaml", yaml.len() as u32 + 10);
+        let err = err_of(&bytes);
+        assert!(err.contains("no coincide con el declarado"), "{err}");
+    }
+
+    #[test]
+    fn rejects_text_over_combined_limit() {
+        let yaml = project_yaml();
+        let f = b"---\ntitle: x\n---\nbody".to_vec();
+        let bytes = build_zip(&[("project.yaml", &yaml), ("findings/001-a.md", &f)], true);
+        assert_eq!(PackageLimits::default().max_text_bytes, 48 * 1024 * 1024);
+        let limits = PackageLimits {
+            max_text_bytes: 100,
+            ..Default::default()
+        };
+        let err = validate_package(&bytes, &limits).unwrap_err();
+        assert!(err.to_string().contains("archivos de texto"), "{err}");
+        assert!(validate_package(&bytes, &PackageLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_front_matter_over_limit() {
+        let yaml = project_yaml();
+        let big = format!(
+            "---\ntitle: x\ndescription: {}\n---\nbody",
+            noise(130 * 1024)
+        );
+        let bytes = build_zip(
+            &[
+                ("project.yaml", &yaml),
+                ("findings/001-x.md", big.as_bytes()),
+            ],
+            true,
+        );
+        let err = err_of(&bytes);
+        assert!(err.contains("front-matter supera"), "{err}");
+
+        let ok = format!(
+            "---\ntitle: x\ndescription: {}\n---\nbody",
+            noise(100 * 1024)
+        );
+        let bytes = build_zip(
+            &[
+                ("project.yaml", &yaml),
+                ("findings/001-x.md", ok.as_bytes()),
+            ],
+            true,
+        );
+        validate_package(&bytes, &PackageLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn rejects_yaml_anchors_aliases_and_tags() {
+        let yaml = b"name: &nombre Demo\nclient: *nombre\n".to_vec();
+        let bytes = build_zip(&[("project.yaml", &yaml)], true);
+        let err = err_of(&bytes);
+        assert!(
+            err.contains("project.yaml invalido") && err.contains("anclas"),
+            "{err}"
+        );
+
+        let project = project_yaml();
+        let finding = b"---\ntitle: !!str x\n---\nbody".to_vec();
+        let bytes = build_zip(
+            &[("project.yaml", &project), ("findings/001-x.md", &finding)],
+            true,
+        );
+        let err = err_of(&bytes);
+        assert!(
+            err.contains("findings/001-x.md") && err.contains("anclas"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_yaml_too_deep() {
+        let mut yaml = String::from("name: Demo\nextra:\n");
+        for level in 1..=33 {
+            yaml.push_str(&" ".repeat(level * 2));
+            yaml.push_str("k:\n");
+        }
+        let bytes = build_zip(&[("project.yaml", yaml.as_bytes())], true);
+        let err = err_of(&bytes);
+        assert!(err.contains("anidamiento demasiado profundo"), "{err}");
+    }
+
+    #[test]
+    fn rejects_yaml_with_too_many_nodes() {
+        let mut yaml = String::from("name: Demo\nextra:\n");
+        yaml.push_str(&"- x\n".repeat(50_000));
+        let bytes = build_zip_with(
+            &[("project.yaml", yaml.as_bytes())],
+            true,
+            CompressionMethod::Stored,
+        );
+        let err = err_of(&bytes);
+        assert!(err.contains("demasiados nodos"), "{err}");
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        out
+    }
+
+    fn gif(width: u16, height: u16) -> Vec<u8> {
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0]);
+        // Descriptor de imagen: el cuadro declara su propio tamano.
+        out.push(0x2C);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&[0, 2, 0, 0x3B]);
+        out
+    }
+
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 11, 8];
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&[1, 1, 0x11, 0, 0xFF, 0xD9]);
+        out
+    }
+
+    fn webp(width: u32, height: u32) -> Vec<u8> {
+        let mut chunk = b"VP8X".to_vec();
+        chunk.extend_from_slice(&10u32.to_le_bytes());
+        chunk.extend_from_slice(&[0, 0, 0, 0]);
+        chunk.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
+        chunk.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(4 + chunk.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend_from_slice(&chunk);
+        out
+    }
+
+    #[test]
+    fn rejects_images_with_huge_declared_dimensions() {
+        let yaml = project_yaml();
+        let huge: [(&str, Vec<u8>); 6] = [
+            ("assets/a.png", png(20_001, 10)),
+            ("assets/b.png", png(10_000, 10_000)),
+            ("assets/c.gif", gif(30_000, 1)),
+            ("assets/d.jpg", jpeg(1, 20_001)),
+            ("assets/e.webp", webp(8_000, 8_000)),
+            ("branding/f.png", png(u32::MAX, u32::MAX)),
+        ];
+        for (name, data) in &huge {
+            let bytes = build_zip(&[("project.yaml", &yaml), (name, data)], true);
+            let err = err_of(&bytes);
+            assert!(err.contains("pixeles"), "{name}: {err}");
+        }
+        let fine: [(&str, Vec<u8>); 4] = [
+            ("assets/a.png", png(20_000, 2_500)),
+            ("assets/c.gif", gif(640, 480)),
+            ("assets/d.jpg", jpeg(4_000, 3_000)),
+            ("assets/e.webp", webp(7_000, 7_000)),
+        ];
+        for (name, data) in &fine {
+            let bytes = build_zip(&[("project.yaml", &yaml), (name, data)], true);
+            validate_package(&bytes, &PackageLimits::default())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ type Result<T> = std::result::Result<T, WorkspaceError>;
 // ---------------------------------------------------------------------------
 
 /// Separa un documento "---\n<yaml>\n---\n<body>" en (yaml, body).
-fn split_front_matter(content: &str, source: &str) -> Result<(String, String)> {
+pub(crate) fn split_front_matter(content: &str, source: &str) -> Result<(String, String)> {
     let trimmed = content.strip_prefix('\u{feff}').unwrap_or(content);
     let trimmed = trimmed.trim_start();
     let rest = trimmed

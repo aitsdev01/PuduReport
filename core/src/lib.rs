@@ -16,3 +16,4 @@ pub mod workspace;
 pub mod naming;
 pub mod package;
 pub mod pdf;
+mod yaml_guard;

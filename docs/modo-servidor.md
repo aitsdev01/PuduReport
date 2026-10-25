@@ -182,13 +182,29 @@ La importacion valida todo antes de escribir:
   conocidas. Nombres duplicados (tambien solo por mayusculas) se rechazan.
 - Sin enlaces simbolicos, entradas cifradas ni tipos especiales.
 - Limites: paquete 200 MiB, descomprimido 200 MiB, 4096 entradas, 1000
-  hallazgos, `project.yaml` 1 MiB, hallazgo 512 KiB, imagen 10 MiB. La lectura se
-  corta en el limite aunque el tamano declarado mienta (anti zip-bomb).
-- Imagenes: extension permitida y firma real (SVG y HTML se rechazan).
+  hallazgos, `project.yaml` 1 MiB, hallazgo 512 KiB, imagen 10 MiB y 48 MiB
+  entre todos los archivos de texto (manifiesto, `project.yaml`,
+  `workspace.yaml` y `findings/*.md`).
+- Anti zip-bomb: los encabezados se revisan antes de descomprimir. Una entrada
+  de mas de 64 KiB no puede expandirse mas de 200 veces, y con mas de 1 MiB de
+  contenido el paquete completo no puede superar 50 veces su tamano. Cada
+  entrada se lee hasta su tamano declarado mas un byte y debe medir
+  exactamente lo declarado, asi un encabezado que miente no provoca lecturas
+  de mas.
+- Imagenes: extension permitida y firma real (SVG y HTML se rechazan). Las
+  dimensiones declaradas (IHDR de PNG, pantalla y cuadros de GIF, SOFn de
+  JPEG, VP8/VP8L/VP8X/ANMF de WebP) no pueden superar 20000 pixeles por lado
+  ni 50 MP: un archivo pequeno no puede pedirle a Typst un lienzo enorme. La
+  exportacion omite esas imagenes.
 - Cada archivo debe estar en el manifiesto con su hash y tamano, y el
   manifiesto no puede listar archivos ausentes.
-- YAML y front-matter con el mismo parser que la app. La marca solo puede
-  apuntar a archivos de `branding/` incluidos.
+- YAML y front-matter con el mismo parser que la app, despues de una revision
+  previa con las reglas del lector de PuduHub: front-matter de hasta 128 KiB,
+  hasta 32 colecciones anidadas (bloque y flujo juntas), hasta 50000 nodos por
+  archivo y 500000 nodos y 8 MiB de YAML entre `project.yaml` y todos los
+  front-matter; sin anclas, alias, etiquetas, directivas ni varios
+  documentos. La marca solo puede apuntar a archivos de `branding/`
+  incluidos.
 - Se escribe en una carpeta temporal que se renombra al final; nunca pisa un
   proyecto existente. En escritorio no se toca la marca del workspace.
 

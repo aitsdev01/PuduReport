@@ -216,6 +216,51 @@ async fn rejects_zip_slip_package() {
     assert!(body["detalle"].as_str().unwrap().contains("ruta"));
 }
 
+/// Paquete minimo con una evidencia PNG que declara un lienzo enorme.
+fn package_with_huge_image() -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let project = b"name: Demo\n".to_vec();
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&60_000u32.to_be_bytes());
+    png.extend_from_slice(&60_000u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    let files = [("project.yaml", &project), ("assets/x.png", &png)];
+    let archivos: Vec<Value> = files
+        .iter()
+        .map(|(ruta, bytes)| {
+            let hash: String = Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            serde_json::json!({"ruta": ruta, "sha256": hash, "bytes": bytes.len()})
+        })
+        .collect();
+    let manifest = serde_json::json!({"formato": 1, "archivos": archivos});
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file("manifest.json", opts).unwrap();
+    zip.write_all(manifest.to_string().as_bytes()).unwrap();
+    for (name, bytes) in files {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn rejects_huge_image_before_rendering() {
+    let (status, _, body) = send(
+        app(config()),
+        render_request(package_with_huge_image(), Some(KEY)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json(&body);
+    assert_eq!(body["error"], "invalid_package");
+    assert!(body["detalle"].as_str().unwrap().contains("pixeles"));
+}
+
 #[tokio::test]
 async fn rejects_garbage_package() {
     let (status, _, body) = send(
