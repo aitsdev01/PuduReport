@@ -24,6 +24,8 @@ interface Props {
   onSelectProject: (id: string) => void;
   onToggleTheme: () => void;
   onCloseWorkspace: () => void;
+  /** Herramientas del proyecto en la barra superior (por ejemplo PuduHub). */
+  projectTools?: ReactNode;
   children: ReactNode;
 }
 
@@ -42,6 +44,7 @@ export function AppShell({
   onSelectProject,
   onToggleTheme,
   onCloseWorkspace,
+  projectTools,
   children,
 }: Props) {
   const [contextOpen, setContextOpen] = useState(true);
@@ -136,6 +139,7 @@ export function AppShell({
           <span className="workspace-location">
             {current?.scope === "project" ? (activeName ?? "Proyecto") : current?.label}
           </span>
+          {current?.scope === "project" && projectTools}
           <button
             className="command-trigger"
             onClick={() => setCommandsOpen(true)}

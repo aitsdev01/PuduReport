@@ -19,6 +19,7 @@ import { ContentEditor } from "./views/ContentEditor";
 import { ReportBuilder } from "./views/ReportBuilder";
 import { TemplateLibrary } from "./views/TemplateLibrary";
 import { ToastProvider, useToast } from "./components/Toast";
+import { PuduHubProjectBar } from "./components/PuduHubProjectBar";
 
 export default function App() {
   return (
@@ -39,6 +40,8 @@ function AppInner() {
   const [activeProject, setActiveProject] = useState<ProjectMeta | null>(null);
   const [projectLoad, setProjectLoad] = useState<"loading" | "ready" | "error">("ready");
   const [projectLoadTick, setProjectLoadTick] = useState(0);
+  // Sube cuando PuduHub reemplaza el proyecto en disco: remonta los editores.
+  const [syncTick, setSyncTick] = useState(0);
   const [pdfTemplates, setPdfTemplates] = useState<PdfTemplate[]>([]);
   const [templatesTick, setTemplatesTick] = useState(0);
   const [view, setView] = useState<View>("inicio");
@@ -135,6 +138,21 @@ function AppInner() {
           setView("proyectos");
         }
       }
+    });
+  }
+
+  // El proyecto cambio en disco por PuduHub: releer meta, listado y editores.
+  function reloadAfterSync() {
+    setSyncTick((tick) => tick + 1);
+    setProjectLoadTick((tick) => tick + 1);
+    void loadProjects();
+  }
+
+  function openFromPuduHub(id: string) {
+    void loadProjects().then(() => {
+      setSyncTick((tick) => tick + 1);
+      if (id === activeProjectId) setProjectLoadTick((tick) => tick + 1);
+      selectProject(id);
     });
   }
 
@@ -239,6 +257,15 @@ function AppInner() {
       freeMarkdown={freeMarkdown}
       dark={dark}
       onToggleTheme={() => setDark((d) => !d)}
+      projectTools={
+        api.capabilities().puduhub && activeProjectId ? (
+          <PuduHubProjectBar
+            projectId={activeProjectId}
+            onBeforeSync={() => guard(flushWrites().then(() => true)).then((ok) => ok === true)}
+            onReplaced={reloadAfterSync}
+          />
+        ) : null
+      }
       onCloseWorkspace={() => {
         void afterSaving(() => {
           workspaceGeneration.current += 1;
@@ -292,12 +319,13 @@ function AppInner() {
               onReload={loadProjects}
               onSelect={selectProject}
               onDelete={deleteProjectById}
+              onPuduHubOpened={openFromPuduHub}
             />
           )}
           {view === "editor" &&
             (freeMarkdown ? (
               <ContentEditor
-                key={activeProjectId ?? "none"}
+                key={`${activeProjectId ?? "none"}-${syncTick}`}
                 projectId={activeProjectId}
                 assetBase={assetBase}
                 onGoToPreview={() => navigate("preview")}
@@ -305,7 +333,7 @@ function AppInner() {
               />
             ) : (
               <FindingEditor
-                key={activeProjectId ?? "none"}
+                key={`${activeProjectId ?? "none"}-${syncTick}`}
                 projectId={activeProjectId}
                 assetBase={assetBase}
                 projectType={activeProject?.project_type}
@@ -317,7 +345,7 @@ function AppInner() {
             ))}
           {view === "reporte" && (
             <ReportBuilder
-              key={activeProjectId ?? "none"}
+              key={`${activeProjectId ?? "none"}-${syncTick}`}
               workspace={workspace}
               projectId={activeProjectId}
               assetBase={assetBase}

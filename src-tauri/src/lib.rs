@@ -13,8 +13,10 @@ mod git;
 mod mcp;
 mod naming;
 mod pdf;
+mod puduhub;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, State};
@@ -36,6 +38,8 @@ const STORE_KEY_WORKSPACE: &str = "workspace_path";
 #[derive(Default)]
 struct AppState {
     workspace: Mutex<Option<PathBuf>>,
+    /// Una operacion con PuduHub a la vez (abrir, enviar, descargar, subir).
+    puduhub_busy: AtomicBool,
 }
 
 /// Helper: devuelve la ruta del workspace abierto o un error legible.
@@ -217,8 +221,13 @@ fn create_workspace(
 }
 
 #[tauri::command]
-fn save_workspace_meta(state: State<AppState>, meta: WorkspaceMeta) -> Result<(), String> {
+fn save_workspace_meta(state: State<AppState>, mut meta: WorkspaceMeta) -> Result<(), String> {
     let root = current_root(&state)?;
+    // La conexion con PuduHub se edita solo con sus comandos: se conserva la
+    // del disco aunque el frontend envie una copia desactualizada.
+    meta.puduhub = workspace::read_workspace_meta(&root)
+        .map_err(|e| e.to_string())?
+        .puduhub;
     workspace::write_workspace_meta(&root, &meta).map_err(|e| e.to_string())
 }
 
@@ -1103,6 +1112,276 @@ fn mcp_disconnect(client: String) -> Result<(), String> {
     mcp::disconnect(mcp::McpClient::parse(&client)?)
 }
 
+// ---------------------------------------------------------------------------
+// Sincronizacion con PuduHub (opt-in). El token personal de editor vive solo
+// en el keychain del SO; la webview nunca lo recibe de vuelta. Toda llamada a
+// PuduHub pasa por estos comandos (ver puduhub/). A diferencia del resto,
+// devuelven un error estructurado (`puduhub::HubError`: codigo estable,
+// mensaje propio y detalles validados) para que la interfaz ofrezca la accion
+// que corresponde (conflictos, bloqueo tomado, token vencido...).
+// ---------------------------------------------------------------------------
+
+/// Servicio del keychain para los tokens de editor de PuduHub.
+const PUDUHUB_KEYRING_SERVICE: &str = "PuduReport-puduhub";
+
+fn hub_root(state: &State<AppState>) -> Result<PathBuf, puduhub::HubError> {
+    current_root(state).map_err(puduhub::HubError::local)
+}
+
+fn keychain_error() -> puduhub::HubError {
+    puduhub::HubError::new(
+        "llavero",
+        "No se pudo acceder al llavero del sistema para el token de PuduHub.",
+    )
+}
+
+/// Entrada de keychain por workspace + servidor.
+fn puduhub_entry(
+    root: &std::path::Path,
+    servidor: &str,
+) -> Result<keyring::Entry, puduhub::HubError> {
+    keyring::Entry::new(
+        PUDUHUB_KEYRING_SERVICE,
+        &format!("{}::{servidor}", root.display()),
+    )
+    .map_err(|_| keychain_error())
+}
+
+fn puduhub_has_token(root: &std::path::Path, servidor: &str) -> Result<bool, puduhub::HubError> {
+    match puduhub_entry(root, servidor)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(_) => Err(keychain_error()),
+    }
+}
+
+/// Servidor configurado en el workspace (sin red).
+fn puduhub_server(root: &std::path::Path) -> Result<Option<String>, puduhub::HubError> {
+    Ok(workspace::read_workspace_meta(root)
+        .map_err(puduhub::HubError::local)?
+        .puduhub
+        .map(|c| c.servidor))
+}
+
+/// Cliente con la conexion del workspace y el token del keychain.
+fn puduhub_client(root: &std::path::Path) -> Result<puduhub::client::HubClient, puduhub::HubError> {
+    let servidor = puduhub_server(root)?.ok_or_else(|| {
+        puduhub::HubError::new(
+            "sin_conexion",
+            "Configure la conexion con PuduHub en Ajustes.",
+        )
+    })?;
+    let token = match puduhub_entry(root, &servidor)?.get_password() {
+        Ok(token) => token,
+        Err(keyring::Error::NoEntry) => {
+            return Err(puduhub::HubError::new(
+                "sin_token",
+                "Falta el token de editor de PuduHub. Guardelo en Ajustes.",
+            ))
+        }
+        Err(_) => return Err(keychain_error()),
+    };
+    puduhub::client::HubClient::new(&servidor, &token)
+}
+
+/// Marca una operacion con PuduHub en curso; se libera al soltarla.
+struct HubBusy<'a>(&'a AtomicBool);
+
+impl<'a> HubBusy<'a> {
+    fn take(flag: &'a AtomicBool) -> Result<Self, puduhub::HubError> {
+        if flag.swap(true, Ordering::SeqCst) {
+            return Err(puduhub::HubError::new(
+                "ocupado",
+                "Ya hay una operacion con PuduHub en curso. Espere a que termine.",
+            ));
+        }
+        Ok(HubBusy(flag))
+    }
+}
+
+impl Drop for HubBusy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Conexion configurada, sin el token: solo si hay uno guardado.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PuduHubConnectionView {
+    servidor: Option<String>,
+    tiene_token: bool,
+}
+
+#[tauri::command]
+fn puduhub_get_connection(
+    state: State<AppState>,
+) -> Result<PuduHubConnectionView, puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let servidor = puduhub_server(&root)?;
+    let tiene_token = match &servidor {
+        Some(s) => puduhub_has_token(&root, s)?,
+        None => false,
+    };
+    Ok(PuduHubConnectionView {
+        servidor,
+        tiene_token,
+    })
+}
+
+/// Guarda la URL en workspace.yaml y, si viene, el token en el keychain. Un
+/// token vacio conserva el guardado para ese servidor.
+#[tauri::command]
+fn puduhub_save_connection(
+    state: State<AppState>,
+    servidor: String,
+    token: String,
+) -> Result<PuduHubConnectionView, puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let servidor = puduhub::normalize_server_url(&servidor)?;
+    let token = token.trim();
+    if !token.is_empty() && !puduhub::is_editor_token(token) {
+        return Err(puduhub::HubError::new(
+            "token_invalido",
+            "El token no tiene el formato de un token de editor de PuduHub (phed_ seguido de 43 caracteres).",
+        ));
+    }
+    let mut meta = workspace::read_workspace_meta(&root).map_err(puduhub::HubError::local)?;
+    let previous = meta.puduhub.as_ref().map(|c| c.servidor.clone());
+    if !token.is_empty() {
+        puduhub_entry(&root, &servidor)?
+            .set_password(token)
+            .map_err(|_| keychain_error())?;
+    }
+    if let Some(previous) = previous.filter(|p| *p != servidor) {
+        if let Ok(entry) = puduhub_entry(&root, &previous) {
+            let _ = entry.delete_credential();
+        }
+    }
+    meta.puduhub = Some(pudureport_core::models::PuduHubConnection {
+        servidor: servidor.clone(),
+    });
+    workspace::write_workspace_meta(&root, &meta).map_err(puduhub::HubError::local)?;
+    Ok(PuduHubConnectionView {
+        tiene_token: puduhub_has_token(&root, &servidor)?,
+        servidor: Some(servidor),
+    })
+}
+
+/// Quita la conexion del workspace y su token del keychain.
+#[tauri::command]
+fn puduhub_delete_connection(state: State<AppState>) -> Result<(), puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let mut meta = workspace::read_workspace_meta(&root).map_err(puduhub::HubError::local)?;
+    if let Some(connection) = meta.puduhub.take() {
+        if let Ok(entry) = puduhub_entry(&root, &connection.servidor) {
+            let _ = entry.delete_credential();
+        }
+    }
+    workspace::write_workspace_meta(&root, &meta).map_err(puduhub::HubError::local)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PuduHubTestResult {
+    servidor: String,
+    total: u64,
+}
+
+/// "Probar conexion": un listado minimo con el token guardado.
+#[tauri::command]
+async fn puduhub_test_connection(
+    state: State<'_, AppState>,
+) -> Result<PuduHubTestResult, puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    let total = client.test().await?;
+    Ok(PuduHubTestResult {
+        servidor: client.servidor().to_string(),
+        total,
+    })
+}
+
+#[tauri::command]
+async fn puduhub_list_informes(
+    state: State<'_, AppState>,
+    page: u32,
+    query: String,
+) -> Result<puduhub::sync::ListResult, puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    puduhub::sync::list(&client, &root, page, &query).await
+}
+
+#[tauri::command]
+async fn puduhub_open_informe(
+    state: State<'_, AppState>,
+    informe_id: String,
+) -> Result<puduhub::sync::OpenResult, puduhub::HubError> {
+    let _busy = HubBusy::take(&state.puduhub_busy)?;
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    let result = puduhub::sync::open_informe(&client, &root, &informe_id).await;
+    let _ = db::reindex(&root);
+    result
+}
+
+/// Estado del vinculo del proyecto (sin red), para la barra del proyecto.
+/// Calcula la huella (lee y resume el proyecto) fuera del hilo principal.
+#[tauri::command]
+async fn puduhub_link_status(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<puduhub::sync::LinkStatus, puduhub::HubError> {
+    let root = hub_root(&state)?;
+    let servidor = puduhub_server(&root)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        puduhub::sync::link_status(&root, &project_id, servidor.as_deref())
+    })
+    .await
+    .map_err(puduhub::HubError::local)?
+}
+
+#[tauri::command]
+async fn puduhub_send_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    forzar: bool,
+) -> Result<puduhub::sync::SyncOutcome, puduhub::HubError> {
+    let _busy = HubBusy::take(&state.puduhub_busy)?;
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    let result = puduhub::sync::send_project(&client, &root, &project_id, forzar).await;
+    let _ = db::reindex(&root);
+    result
+}
+
+#[tauri::command]
+async fn puduhub_download_server_version(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<puduhub::sync::DownloadResult, puduhub::HubError> {
+    let _busy = HubBusy::take(&state.puduhub_busy)?;
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    let result = puduhub::sync::download_server_version(&client, &root, &project_id).await;
+    let _ = db::reindex(&root);
+    result
+}
+
+#[tauri::command]
+async fn puduhub_upload_new(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<puduhub::sync::SyncOutcome, puduhub::HubError> {
+    let _busy = HubBusy::take(&state.puduhub_busy)?;
+    let root = hub_root(&state)?;
+    let client = puduhub_client(&root)?;
+    let result = puduhub::sync::upload_new(&client, &root, &project_id).await;
+    let _ = db::reindex(&root);
+    result
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1172,6 +1451,16 @@ pub fn run() {
             mcp_status,
             mcp_connect,
             mcp_disconnect,
+            puduhub_get_connection,
+            puduhub_save_connection,
+            puduhub_delete_connection,
+            puduhub_test_connection,
+            puduhub_list_informes,
+            puduhub_open_informe,
+            puduhub_link_status,
+            puduhub_send_project,
+            puduhub_download_server_version,
+            puduhub_upload_new,
         ])
         .run(tauri::generate_context!())
         .expect("error al iniciar la aplicacion Tauri");

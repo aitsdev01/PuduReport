@@ -26,6 +26,7 @@ import type {
   WorkspaceMeta,
   WorkspaceStats,
 } from "../types";
+import type { PuduHubApi } from "../puduhub";
 
 /**
  * Que puede hacer la capa de datos activa. Las pantallas ocultan o desactivan
@@ -55,6 +56,8 @@ export interface Capabilities {
   pagePreview: boolean;
   /** Exportar e importar paquetes .pudupkg. */
   packages: boolean;
+  /** Sincronizacion de escritorio con PuduHub (token en el keychain). */
+  puduhub: boolean;
 }
 
 /** Resultado de exportar un paquete .pudupkg. */
@@ -66,6 +69,8 @@ export interface PackageExport {
 
 export interface Backend {
   readonly capabilities: Capabilities;
+  /** Sincronizacion con PuduHub; solo existe si `capabilities.puduhub`. */
+  readonly puduhub?: PuduHubApi;
 
   /** URL cargable de una evidencia del proyecto (ruta relativa assets/...). */
   assetUrl(projectId: string, relPath: string): string;

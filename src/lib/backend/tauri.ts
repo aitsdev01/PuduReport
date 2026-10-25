@@ -7,6 +7,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Backend, Capabilities } from "./types";
 import type { WorkspaceMeta } from "../types";
+import type { PuduHubApi } from "../puduhub";
 
 const DESKTOP: Capabilities = {
   mode: "desktop",
@@ -21,6 +22,22 @@ const DESKTOP: Capabilities = {
   localFiles: true,
   pagePreview: true,
   packages: true,
+  puduhub: true,
+};
+
+// Sincronizacion con PuduHub: todo pasa por comandos de Rust. El token se
+// envia una sola vez al guardarlo y nunca vuelve a la webview.
+const PUDUHUB: PuduHubApi = {
+  getConnection: () => invoke("puduhub_get_connection"),
+  saveConnection: (servidor, token) => invoke("puduhub_save_connection", { servidor, token }),
+  deleteConnection: () => invoke("puduhub_delete_connection"),
+  testConnection: () => invoke("puduhub_test_connection"),
+  listInformes: (page, query) => invoke("puduhub_list_informes", { page, query }),
+  openInforme: (informeId) => invoke("puduhub_open_informe", { informeId }),
+  linkStatus: (projectId) => invoke("puduhub_link_status", { projectId }),
+  sendProject: (projectId, forzar) => invoke("puduhub_send_project", { projectId, forzar }),
+  downloadServerVersion: (projectId) => invoke("puduhub_download_server_version", { projectId }),
+  uploadNew: (projectId) => invoke("puduhub_upload_new", { projectId }),
 };
 
 /** Convierte una ruta local a URL del protocolo asset; ante error, la deja igual. */
@@ -44,6 +61,7 @@ export function createTauriBackend(): Backend {
 
   return {
     capabilities: DESKTOP,
+    puduhub: PUDUHUB,
 
     assetUrl: (projectId, relPath) => (root ? fileSrc(`${root}/${projectId}/${relPath}`) : relPath),
     brandingAssetUrl: (path) => (root && path ? fileSrc(`${root}${path}`) : ""),

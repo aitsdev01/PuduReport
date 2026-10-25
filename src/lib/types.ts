@@ -255,6 +255,11 @@ export interface WorkspaceMeta {
   project_order: string[];
   /** Destinos de exportacion a API externa (opt-in, editables). */
   export_targets: ExportTarget[];
+  /**
+   * Conexion con PuduHub (solo la URL; el token vive en el keychain). La
+   * administran los comandos de PuduHub: guardar el workspace no la cambia.
+   */
+  puduhub?: { servidor: string } | null;
 }
 
 /**

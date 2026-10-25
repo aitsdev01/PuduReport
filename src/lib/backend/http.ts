@@ -47,6 +47,7 @@ const WEB: Capabilities = {
   localFiles: false,
   pagePreview: false,
   packages: false,
+  puduhub: false,
 };
 
 /** Cookie y cabecera CSRF de la sesion de PuduHub (las de Angular). */

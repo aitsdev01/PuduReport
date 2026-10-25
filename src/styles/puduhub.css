@@ -1,0 +1,98 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Copyright (c) 2026 bc0d3 */
+
+/* Sincronizacion con PuduHub (solo escritorio). */
+.hub-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  min-width: 0;
+}
+.hub-bar + .command-trigger {
+  margin-left: 0;
+}
+.hub-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.hub-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex-shrink: 0;
+}
+.hub-dot.pending {
+  background: var(--sev-medium);
+}
+.hub-dot.invalid {
+  background: var(--danger);
+}
+.hub-dialog {
+  width: 620px;
+}
+.hub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 0;
+  list-style: none;
+}
+.hub-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-panel);
+}
+.hub-row-main {
+  flex: 1;
+  min-width: 0;
+}
+.hub-row-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.hub-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.hub-row-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+}
+.hub-warning {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--sev-medium);
+  background: var(--bg-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.hub-error {
+  border-left-color: var(--danger);
+}
+.hub-conflicts {
+  margin: 8px 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+}

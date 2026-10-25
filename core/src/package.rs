@@ -489,7 +489,8 @@ fn check_image_dimensions(name: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// SHA-256 en hexadecimal minuscula (el mismo del manifiesto).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -511,6 +512,7 @@ fn portable_workspace(ws: &WorkspaceMeta) -> WorkspaceMeta {
         watermark: ws.watermark.clone(),
         project_order: Vec::new(),
         export_targets: Vec::new(),
+        puduhub: None,
     }
 }
 

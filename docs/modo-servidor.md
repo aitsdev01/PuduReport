@@ -12,7 +12,8 @@ pueda alojar informes sin crear un segundo editor ni un segundo motor de PDF:
    moverlo entre equipos o enviarlo al servicio.
 
 La app de escritorio no cambia de comportamiento: sigue sin red salvo los
-destinos de exportacion que el usuario configure.
+destinos de exportacion y la conexion con PuduHub que el usuario configure
+(ver [Sincronizacion desde escritorio](#sincronizacion-desde-escritorio)).
 
 ```text
             escritorio                                 navegador
@@ -273,6 +274,128 @@ la imagen. En resumen:
 - Contenedor: limitar memoria y procesos (el compose de PuduHub usa 1 GiB y
   256 pids con `PUDUREPORT_SERVICE_CONCURRENCY=2`). Ver service/README.md.
 - El paquete se valida completo antes de escribir; ver la lista de arriba.
+
+## Sincronizacion desde escritorio
+
+El ingeniero abre un informe de PuduHub en la app de escritorio, lo edita sin
+conexion con todas las herramientas locales y envia la actualizacion.
+PuduHub fusiona en tres vias por entidad (cada campo del proyecto, cada
+seccion, cada hallazgo, el orden y cada evidencia) y solo reporta conflicto si
+la misma entidad cambio distinto en los dos lados. Es opcional y esta apagada
+hasta configurar la conexion.
+
+### Conexion (Ajustes, "Conexion con PuduHub")
+
+- URL base de PuduHub. Solo `https://`; para desarrollo se acepta `http://`
+  hacia `localhost`, `127.0.0.1` o `[::1]` (sin proxy). Sin usuario, consulta
+  ni fragmento. Se guarda en `workspace.yaml` (`puduhub.servidor`), una por
+  workspace; guardar el workspace desde otras pantallas no la cambia.
+- Token personal de editor (`phed_` + 43 caracteres), generado en PuduHub. Se
+  envia una sola vez al backend Rust, que lo guarda en el keychain del SO
+  (servicio `PuduReport-puduhub`, cuenta `<workspace>::<servidor>`). Nunca va a
+  archivos, registros ni al estado de la interfaz: el campo se vacia al
+  guardar y la interfaz solo sabe si hay uno guardado.
+- "Probar conexion": `GET /api/editor/informes?page=1&pageSize=10`. Errores
+  explicados: token invalido, vencido o revocado (`401`), sin permiso (`403`),
+  sin red, tiempo agotado y TLS (certificado no valido o no confiable, por
+  ejemplo un proxy corporativo que inspecciona TLS).
+
+### Cliente HTTP (Rust, `src-tauri/src/puduhub/`)
+
+- La webview nunca ve el token: todas las llamadas son comandos de Tauri
+  (`puduhub_*`). Mismo cliente que los destinos de exportacion (`reqwest` con
+  rustls), sin dependencias nuevas.
+- Los comandos rechazan con un error estructurado
+  `{codigo, mensaje, bloqueo?, conflictos?, contexto?, reintentarEn?, proyectoId?, puedeForzar?}`;
+  `mensaje` es un texto propio y `codigo` decide que ofrece la interfaz.
+- `Authorization: Bearer phed_...` (cabecera marcada como sensible), sin
+  cookies ni CSRF. Rutas `/api/editor/informes`.
+- Sin redirecciones: una respuesta 3xx es un error, asi el token nunca viaja a
+  otro origen. Solo `https` salvo localhost.
+- Plazos: conexion 10 s, JSON 30 s, paquetes 300 s. Topes de respuesta: JSON 4
+  MiB, errores 64 KiB, paquete 200 MiB (la lectura se corta en el tope aunque
+  el servidor no declare el tamano). El paquete a enviar tambien se limita a
+  200 MiB.
+- Errores por `(estado, codigo)`: el cuerpo de una respuesta de error nunca se
+  muestra; solo se copian, validados, el bloqueo (`nombre`, `hasta`, `origen`,
+  `propio`), los conflictos (`entidad`, `id`, `campo`) y `retryAfter`. Ningun
+  mensaje incluye el token (hay pruebas para eso).
+- Cada fila del listado se valida antes de mostrarla (id UUID, estado,
+  version, fecha ISO, texto sin caracteres de control y acotado); las que no
+  pasan se omiten y se informa cuantas.
+
+| Peticion | Uso |
+|---|---|
+| `GET /api/editor/informes?page=N&pageSize=20[&q=]` | Listar los informes asignados; tambien "Probar conexion" (`pageSize=10`) |
+| `POST /api/editor/informes` `{titulo, tipo}` | Subir como nuevo informe |
+| `GET /{id}/paquete[?version=N]` | Bajar el `.pudupkg` (sin `version`: el borrador como punto de control) |
+| `POST /{id}/bloqueo` `{forzar}` | Tomar el bloqueo antes de sincronizar (devuelve el token del bloqueo) |
+| `POST /{id}/sincronizar` (paquete `application/zip`, `X-Lock-Token`) | Enviar; respuesta `{revision, version: {version, ...}}` |
+| `DELETE /{id}/bloqueo` (`X-Lock-Token`) | Liberar el bloqueo, siempre, tambien si la sincronizacion falla |
+
+### Flujo
+
+1. **Abrir desde PuduHub** (Proyectos): lista titulo, tipo, estado, ultima
+   version y quien tiene el bloqueo. "Descargar y abrir" baja el paquete de la
+   ultima version y lo importa con el importador estricto de `package.rs`.
+   Si el informe ya esta en este equipo, "Actualizar copia local" solo se
+   ofrece si no tiene cambios sin enviar; si los tiene, se avisa y no se toca.
+2. **Vinculo**: `<proyecto>/.puduhub.json` con `servidor`, `informeId`,
+   `baseVersion`, `sincronizadoAt` y la huella del contenido. Sin token. No
+   entra en el paquete y se agrega al `.gitignore` del workspace si usa git.
+   La huella es el SHA-256 del contenido ya interpretado (proyecto, hallazgos y
+   evidencias), asi que reescribir un archivo sin cambios no cuenta como
+   cambio.
+3. **Indicador** en la barra del proyecto: "Vinculado a PuduHub, version N;
+   cambios sin enviar: si/no", con "Actualizar" y "Enviar a PuduHub".
+4. **Enviar a PuduHub**: guarda lo pendiente, exporta el paquete con
+   `informeId`, `version` y `baseVersion` = la base del vinculo, toma el
+   bloqueo, sincroniza y lo libera. PuduHub no devuelve el documento fusionado,
+   asi que la app baja `GET /{id}/paquete?version=N` de la version creada, lo
+   valida y reemplaza el proyecto local (los PDF de `build/` se conservan).
+   Muestra la version nueva y lo que llego de otras personas (hallazgos,
+   secciones, datos del proyecto, evidencias, orden). Si el proyecto cambio
+   durante el envio, o la descarga falla, la base no avanza y se avisa: el
+   proximo envio vuelve a fusionar sin perder cambios de nadie.
+5. **Conflicto** (`409 merge_conflict`): lista cada entidad con su nombre
+   local (titulo del hallazgo, titulo de la seccion, etiqueta del campo del
+   proyecto). No se envia ni se pisa nada. "Descargar version del servidor"
+   guarda primero una copia completa del proyecto como proyecto aparte
+   (`<id>-respaldo-<fecha>`, nombre con "(respaldo local)" y sin vinculo) y
+   luego reemplaza el proyecto por la version de PuduHub. "Cancelar" no hace
+   nada.
+6. **Otros errores**: `lock_held` (quien, desde donde y hasta cuando; si es
+   otra sesion del mismo usuario se ofrece "Tomar el bloqueo y enviar" con
+   `forzar: true`), `lock_required`, `stale_revision`, `unknown_base_version`
+   (ofrece descargar la version del servidor), `401`, `403`, `404`, `413`,
+   `415`, `422` (`invalid_package` / `invalid_payload`), `429` y `5xx`.
+7. **Subir a PuduHub** (proyecto sin vincular): `POST /` con el nombre y el
+   tipo del proyecto. El rol Ingeniero puede crear informes y queda asignado
+   al que crea. Luego `GET /{id}/paquete` (PuduHub crea la version 1 vacia como
+   punto de control), se escribe el vinculo con base 1 y se envia con la
+   sincronizacion normal: como la base y el borrador del servidor son
+   iguales, entra todo lo local sin conflictos. Si el envio falla, el informe
+   ya existe y el proyecto queda vinculado para reintentar.
+
+### Marca
+
+Al abrir un informe no se aplica su `workspace.yaml` (la marca del workspace
+local es compartida por todos sus proyectos), y el envio normal no incluye
+`workspace.yaml`: PuduHub conserva la marca del informe. "Subir a PuduHub" si
+incluye la marca del workspace, para que el informe nuevo tenga el mismo
+logo, colores y marca de agua.
+
+### Seguridad
+
+- El importador del paquete es el mismo y estricto (rutas, tamanos, firmas de
+  imagen, hashes y YAML) y ademas exige que el manifiesto sea del informe
+  pedido y traiga una version valida. Solo `package.rs` decide rutas en
+  disco: ningun dato del servidor elige donde se escribe.
+- El reemplazo de un proyecto escribe la version nueva en una carpeta aparte y
+  la intercambia al final; si algo falla, el proyecto anterior vuelve a su
+  lugar.
+- Un proyecto vinculado a otro servidor no se envia al configurado.
+- Una sola operacion con PuduHub a la vez.
 
 ## Exportacion a API: `uid`
 

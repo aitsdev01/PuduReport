@@ -6,6 +6,7 @@ import * as api from "../lib/api";
 import type { WorkspaceMeta } from "../lib/types";
 import { PromptDialog } from "../components/PromptDialog";
 import { McpClientCard } from "../components/McpClientCard";
+import { PuduHubConnectionCard } from "../components/PuduHubConnectionCard";
 import { useToast } from "../components/Toast";
 
 interface Props {
@@ -39,7 +40,9 @@ export function Settings({ workspace, workspacePath, dark, onSetDark, onWorkspac
       <div className="screen-head">
         <div>
           <h1>Ajustes</h1>
-          <p className="sub">Configuracion local. Nada se sincroniza.</p>
+          <p className="sub">
+            Configuracion local. Nada se sincroniza salvo lo que usted envie a PuduHub.
+          </p>
         </div>
       </div>
 
@@ -70,6 +73,8 @@ export function Settings({ workspace, workspacePath, dark, onSetDark, onWorkspac
             </div>
           </div>
         </div>
+
+        {api.capabilities().puduhub && <PuduHubConnectionCard key={workspacePath ?? ""} />}
 
         <McpClientCard
           client="desktop"

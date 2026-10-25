@@ -19,6 +19,13 @@ Todo cambio notable se documenta en este archivo. El formato sigue Keep a Change
   - Paquete `.pudupkg` (`core/src/package.rs`): exportacion determinista con manifiesto y SHA-256 por archivo, e importacion con validacion estricta (zip-slip, rutas absolutas, enlaces simbolicos, tamano descomprimido, cantidad de archivos, extensiones y firmas de imagen, hashes y YAML). En la app: "Exportar paquete" en Vista previa e "Importar paquete" en Proyectos.
   - Servicio `pudureport-service` (`service/`): `POST /v1/render` (paquete a PDF con el mismo motor y plantillas), `POST /v1/cvss`, `POST /v1/proyecto-inicial` (el `project.yaml` de un proyecto nuevo de un tipo, igual al que crea la app) y `GET /healthz`; clave compartida comparada en tiempo constante, limites de tamano, tiempo y concurrencia, temporal por trabajo y registros sin contenido. Incluye `Dockerfile` (base fijada por digest, Typst con hash verificado, sin root).
 - Campo opcional `uid` (id estable del hallazgo) en la exportacion a API y en el CSV. No viene activado por defecto.
+- Sincronizacion de escritorio con PuduHub (ver `docs/modo-servidor.md`, "Sincronizacion desde escritorio"):
+  - Ajustes, "Conexion con PuduHub": URL base (solo https; http solo para localhost) y token personal de editor guardado solo en el keychain del SO, con "Probar conexion" y errores explicados (token invalido o vencido, permisos, red y TLS).
+  - Proyectos, "Abrir desde PuduHub": informes asignados con tipo, estado, version y bloqueo; descarga el paquete y lo importa con el importador estricto. Una copia local se actualiza solo si no tiene cambios sin enviar.
+  - Barra del proyecto: "Vinculado a PuduHub, version N; cambios sin enviar: si/no", "Enviar a PuduHub" (bloqueo, sincronizacion con fusion de tres vias y aplicacion del resultado) y "Actualizar".
+  - Conflictos listados con nombres legibles (hallazgo, seccion o campo del proyecto) y "Descargar version del servidor" con respaldo local del proyecto. Mensajes para bloqueo tomado, revision desactualizada, version base desconocida, 401, 403, 413 y 422.
+  - "Subir a PuduHub": crea un informe nuevo con el proyecto local.
+  - Cliente HTTP en Rust: la webview nunca ve el token, sin redirecciones, plazos estrictos y topes de tamano (paquete hasta 200 MiB).
 
 ### Changed
 - El pipeline de PDF del core admite un limite de tiempo (mata a Typst al vencer) y un render con las plantillas incluidas y plantilla opcional; la app de escritorio no usa limite.
@@ -42,6 +49,7 @@ Todo cambio notable se documenta en este archivo. El formato sigue Keep a Change
 - Los campos de negocio no estan en los campos por default de los destinos ni del CSV: los destinos existentes reciben el mismo payload. Los hallazgos y `project.yaml` previos se leen sin cambios y los campos vacios no se escriben a disco. Una categoria o prioridad fuera de la lista, una causa raiz inexistente o un hallazgo inexistente en el plan se descartan al leer y al guardar.
 - Los proyectos Pentest, Red Team y Ejecutivo existentes reciben los cuatro bloques nuevos en su orden del documento (despues del resumen). Sin datos no generan contenido, asi que el PDF no cambia hasta que se cargan. El resto de los tipos y plantillas no cambia.
 - La app de escritorio funciona igual que antes: el modo servidor es una compilacion y un binario aparte. El campo `uid` solo sale si el destino lo activa.
+- Sin conexion con PuduHub configurada la app no hace ninguna llamada nueva. `workspace.yaml` solo agrega `puduhub.servidor` al configurarla (sin secretos) y el paquete `.pudupkg` no cambia de formato. El vinculo de cada proyecto vive en `.puduhub.json`, fuera del paquete y del git del workspace.
 
 ## [0.0.25] - 2026-09-21
 

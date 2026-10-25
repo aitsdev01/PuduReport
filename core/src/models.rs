@@ -1010,6 +1010,19 @@ pub struct WorkspaceMeta {
     /// default: sin destinos, la app no hace ninguna llamada de red.
     #[serde(default)]
     pub export_targets: Vec<ExportTarget>,
+    /// Conexion con PuduHub (opt-in): solo la URL base. El token del editor
+    /// nunca se guarda aca: vive en el keychain del SO. Ausente por default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puduhub: Option<PuduHubConnection>,
+}
+
+/// Conexion del workspace con PuduHub para la sincronizacion de escritorio.
+/// No incluye secretos: el token personal de editor (`phed_...`) vive en el
+/// keychain del SO, referenciado por workspace y servidor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PuduHubConnection {
+    /// URL base de PuduHub (https; http solo para localhost en desarrollo).
+    pub servidor: String,
 }
 
 /// Destino de exportacion a una API externa (opt-in, configurable y editable

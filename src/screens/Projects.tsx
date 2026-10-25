@@ -17,6 +17,7 @@ import { SEVERITY_COLOR, SEVERITY_LABEL, SEVERITY_LETTER, SEVERITY_ORDER } from 
 import { Modal } from "../components/Modal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Dashboard } from "../components/Dashboard";
+import { PuduHubOpenDialog } from "../components/PuduHubOpenDialog";
 import { useToast } from "../components/Toast";
 
 interface Props {
@@ -27,6 +28,8 @@ interface Props {
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onOpenBoard: () => void;
+  /** Un proyecto se descargo o actualizo desde PuduHub. */
+  onPuduHubOpened?: (id: string) => void;
 }
 
 type SortKey =
@@ -72,6 +75,7 @@ export function Projects({
   onSelect,
   onDelete,
   onOpenBoard,
+  onPuduHubOpened,
 }: Props) {
   const { guard, notify } = useToast();
   // El tablero es la vista principal; cada usuario puede cambiar a tabla y su
@@ -85,6 +89,7 @@ export function Projects({
     window.localStorage.setItem("pudu-projects-view", v);
   }
   const [creating, setCreating] = useState(false);
+  const [hubOpen, setHubOpen] = useState(false);
   const [toDelete, setToDelete] = useState<ProjectSummary | null>(null);
   const [toRename, setToRename] = useState<ProjectSummary | null>(null);
   const [query, setQuery] = useState("");
@@ -182,12 +187,25 @@ export function Projects({
             <i className="ti ti-package-import" />
             Importar paquete
           </button>
+          {api.capabilities().puduhub && onPuduHubOpened && (
+            <button
+              className="btn"
+              onClick={() => setHubOpen(true)}
+              title="Descargar un informe asignado en PuduHub y editarlo sin conexion"
+            >
+              <i className="ti ti-cloud-download" />
+              Abrir desde PuduHub
+            </button>
+          )}
           <button className="btn primary" onClick={() => setCreating(true)}>
             <i className="ti ti-plus" />
             Nuevo proyecto
           </button>
         </div>
       </div>
+      {hubOpen && onPuduHubOpened && (
+        <PuduHubOpenDialog onClose={() => setHubOpen(false)} onOpened={onPuduHubOpened} />
+      )}
 
       <div className="view" style={{ paddingTop: 16 }}>
         {projects.length === 0 ? (

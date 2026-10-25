@@ -7,6 +7,7 @@
 // directamente.
 import { getBackend } from "./backend";
 import type { Capabilities, PackageExport } from "./backend";
+import type { PuduHubApi } from "./puduhub";
 import type {
   ApiSendResult,
   CvssResult,
@@ -384,4 +385,16 @@ export function lastGeneratedPdf(projectId: string): string | null {
 /** Descarga un PDF generado en el servidor (solo web). */
 export function downloadGeneratedPdf(projectId: string, url: string): Promise<void> {
   return getBackend().downloadGeneratedPdf(projectId, url);
+}
+
+/**
+ * Sincronizacion con PuduHub (solo escritorio). Las pantallas la usan solo si
+ * `capabilities().puduhub`; el editor web no la tiene.
+ */
+export function puduhub(): PuduHubApi {
+  const sync = getBackend().puduhub;
+  if (!sync) {
+    throw new Error("La sincronizacion con PuduHub no esta disponible.");
+  }
+  return sync;
 }

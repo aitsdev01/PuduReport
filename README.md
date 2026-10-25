@@ -99,7 +99,7 @@ apta para versionar con git.
 
 ## Privacidad
 
-Sin telemetria. La unica salida de red automatica es la verificacion de actualizaciones. De forma opcional podes configurar una exportacion a una API propia (apagada por default): solo envia la metadata que elijas, nunca el cuerpo ni la PoC, y siempre te muestra que sale antes de enviar. Fuera de eso, los reportes no salen de tu equipo.
+Sin telemetria. La unica salida de red automatica es la verificacion de actualizaciones. De forma opcional podes configurar una exportacion a una API propia (apagada por default): solo envia la metadata que elijas, nunca el cuerpo ni la PoC, y siempre te muestra que sale antes de enviar. Tambien es opcional la sincronizacion con PuduHub (apagada por default, ver [docs/modo-servidor.md](docs/modo-servidor.md#sincronizacion-desde-escritorio)): solo envia el proyecto completo al pulsar "Enviar a PuduHub" o "Subir a PuduHub". Fuera de eso, los reportes no salen de tu equipo.
 
 ## Seguridad
 
