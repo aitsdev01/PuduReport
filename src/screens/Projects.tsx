@@ -73,7 +73,7 @@ export function Projects({
   onDelete,
   onOpenBoard,
 }: Props) {
-  const { guard } = useToast();
+  const { guard, notify } = useToast();
   // El tablero es la vista principal; cada usuario puede cambiar a tabla y su
   // eleccion se recuerda (igual que el tema).
   const [view, setView] = useState<"table" | "board">(
@@ -113,6 +113,16 @@ export function Projects({
   async function handleExample() {
     const summary = await guard(api.createExampleProject(), "Proyecto de ejemplo creado");
     if (summary) {
+      await onReload();
+      onSelect(summary.id);
+    }
+  }
+
+  // Importa un paquete .pudupkg como proyecto nuevo (no pisa ninguno).
+  async function handleImportPackage() {
+    const summary = await guard(api.importPackage());
+    if (summary) {
+      notify(`Paquete importado: ${summary.name}`, "ok");
       await onReload();
       onSelect(summary.id);
     }
@@ -163,6 +173,14 @@ export function Projects({
           <button className="btn" onClick={handleExample}>
             <i className="ti ti-sparkles" />
             Cargar ejemplo
+          </button>
+          <button
+            className="btn"
+            onClick={handleImportPackage}
+            title="Importar un paquete .pudupkg como proyecto nuevo"
+          >
+            <i className="ti ti-package-import" />
+            Importar paquete
           </button>
           <button className="btn primary" onClick={() => setCreating(true)}>
             <i className="ti ti-plus" />

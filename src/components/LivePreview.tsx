@@ -23,6 +23,8 @@ interface Props {
  */
 export function LivePreview({ projectId, refreshKey, emptyHint, onLoadingChange }: Props) {
   const { guard } = useToast();
+  // El editor web no compila localmente: el PDF se genera en PuduHub.
+  const pagePreview = api.capabilities().pagePreview;
   const [pages, setPages] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   // Guard anti-solapamiento: si llega un refresco mientras compila, se marca
@@ -31,7 +33,7 @@ export function LivePreview({ projectId, refreshKey, emptyHint, onLoadingChange 
   const pending = useRef(false);
 
   const run = useCallback(async () => {
-    if (!projectId) return;
+    if (!projectId || !pagePreview) return;
     if (busy.current) {
       pending.current = true;
       return;
@@ -45,7 +47,7 @@ export function LivePreview({ projectId, refreshKey, emptyHint, onLoadingChange 
     } while (pending.current);
     busy.current = false;
     setLoading(false);
-  }, [guard, projectId]);
+  }, [guard, projectId, pagePreview]);
 
   useEffect(() => {
     run();
@@ -57,6 +59,18 @@ export function LivePreview({ projectId, refreshKey, emptyHint, onLoadingChange 
 
   if (!projectId) {
     return <div className="empty">{emptyHint ?? "Selecciona un proyecto para previsualizar."}</div>;
+  }
+
+  if (!pagePreview) {
+    return (
+      <div className="web-pdf-panel" role="note">
+        <i className="ti ti-file-type-pdf" aria-hidden="true" />
+        <span>
+          El PDF se genera en PuduHub con el mismo motor y plantillas que la app de escritorio. Usa
+          la vista PDF para generarlo y descargarlo.
+        </span>
+      </div>
+    );
   }
 
   if (loading && pages.length === 0) {

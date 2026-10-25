@@ -1,0 +1,16 @@
+# Contexto de service/Dockerfile (se construye desde la raiz del repo).
+.git
+target
+node_modules
+dist
+dist-web
+src-tauri/target
+src-tauri/gen
+src-tauri/binaries
+**/build
+**/.DS_Store
+.env
+.env.*
+*.key
+*.pem
+*.p12

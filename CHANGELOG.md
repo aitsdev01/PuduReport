@@ -13,6 +13,16 @@ Todo cambio notable se documenta en este archivo. El formato sigue Keep a Change
 - Exportacion CSV y destinos de API con los campos opcionales `modulo`, `impacto_negocio`, `categoria_riesgo` y `causa_raiz`.
 - `update_finding` del servidor MCP acepta `impacto_negocio`, `categoria_riesgo` y `modulo`, con validacion de lista y largo.
 - El proyecto de ejemplo incluye causas raiz, plan de remediacion y los campos de negocio en sus hallazgos.
+- Modo servidor (ver `docs/modo-servidor.md`):
+  - Capa de datos intercambiable (`src/lib/backend/`): `TauriBackend` para escritorio y `HttpBackend` para la API de informes de PuduHub (mismo origen, CSRF, bloqueo de edicion renovado cada 60 s y control de `revision` en cada escritura). `lib/api.ts` conserva sus funciones.
+  - Editor web: `npm run build:web` genera `dist-web/` sin dependencias de Tauri, con base configurable (`PUDU_WEB_BASE`, por defecto `/editor/`), informe por `?informe=<uuid>` validado y CSP sin `eval`. Trabaja sobre un solo informe y oculta lo que es solo de escritorio.
+  - Paquete `.pudupkg` (`core/src/package.rs`): exportacion determinista con manifiesto y SHA-256 por archivo, e importacion con validacion estricta (zip-slip, rutas absolutas, enlaces simbolicos, tamano descomprimido, cantidad de archivos, extensiones y firmas de imagen, hashes y YAML). En la app: "Exportar paquete" en Vista previa e "Importar paquete" en Proyectos.
+  - Servicio `pudureport-service` (`service/`): `POST /v1/render` (paquete a PDF con el mismo motor y plantillas), `POST /v1/cvss`, `POST /v1/proyecto-inicial` (el `project.yaml` de un proyecto nuevo de un tipo, igual al que crea la app) y `GET /healthz`; clave compartida comparada en tiempo constante, limites de tamano, tiempo y concurrencia, temporal por trabajo y registros sin contenido. Incluye `Dockerfile` (base fijada por digest, Typst con hash verificado, sin root).
+- Campo opcional `uid` (id estable del hallazgo) en la exportacion a API y en el CSV. No viene activado por defecto.
+
+### Changed
+- El pipeline de PDF del core admite un limite de tiempo (mata a Typst al vencer) y un render con las plantillas incluidas y plantilla opcional; la app de escritorio no usa limite.
+- `pudureport-core` declara `rust-version = "1.88"` (lo exige `zip`).
 
 ### Security
 - La exportacion CSV neutraliza la inyeccion de formulas: toda celda cuyo primer caracter no blanco sea `=`, `+`, `-` o `@`, o que empiece con tabulador o retorno de carro, se exporta con una comilla simple delante para que Excel, LibreOffice o Google Sheets la muestren como texto. Aplica a todas las columnas, incluidas las de texto libre `modulo`, `impacto_negocio` y `causa_raiz`; el entrecomillado RFC 4180 se aplica despues. Los valores CVSS (ej. `9.8`) no cambian; un numero negativo, que hoy ninguna columna produce, se exportaria como texto.
@@ -21,6 +31,7 @@ Todo cambio notable se documenta en este archivo. El formato sigue Keep a Change
 - Los destinos existentes y los nuevos arrancan con estos datos apagados: el payload es el mismo de siempre hasta que el usuario los active. Los `project.yaml` previos se leen sin cambios (ambos campos quedan sin especificar) y cualquier valor fuera de la lista se descarta.
 - Los campos de negocio no estan en los campos por default de los destinos ni del CSV: los destinos existentes reciben el mismo payload. Los hallazgos y `project.yaml` previos se leen sin cambios y los campos vacios no se escriben a disco. Una categoria o prioridad fuera de la lista, una causa raiz inexistente o un hallazgo inexistente en el plan se descartan al leer y al guardar.
 - Los proyectos Pentest, Red Team y Ejecutivo existentes reciben los cuatro bloques nuevos en su orden del documento (despues del resumen). Sin datos no generan contenido, asi que el PDF no cambia hasta que se cargan. El resto de los tipos y plantillas no cambia.
+- La app de escritorio funciona igual que antes: el modo servidor es una compilacion y un binario aparte. El campo `uid` solo sale si el destino lo activa.
 
 ## [0.0.25] - 2026-09-21
 

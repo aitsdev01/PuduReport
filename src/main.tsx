@@ -4,6 +4,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { setBackend } from "./lib/backend";
+import { createTauriBackend } from "./lib/backend/tauri";
 
 // Fuentes e iconos empaquetados (offline, sin CDN).
 import "@fontsource/inter/400.css";
@@ -14,6 +16,9 @@ import "@tabler/icons-webfont/dist/tabler-icons.min.css";
 
 import "./styles.css";
 import "./styles/workbench.css";
+
+// Escritorio: la capa de datos es el IPC con el backend Rust.
+setBackend(createTauriBackend());
 
 const root = document.getElementById("root");
 if (!root) {

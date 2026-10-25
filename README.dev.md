@@ -42,7 +42,9 @@ src/                      frontend React + TS
   components/             Rail, Sidebar, MarkdownEditor, CvssCalculator, Severity, Toast, Modal
   screens/                Onboarding, Projects, CoverEditor, PdfPreview, Settings
   views/                  FindingEditor, ReportBuilder, TemplateLibrary
-  lib/                    api.ts (IPC tipado), types.ts, sections.ts, cvssMetrics.ts, severity.ts
+  lib/                    api.ts (puerta de datos tipada), types.ts, sections.ts, cvssMetrics.ts, severity.ts
+  lib/backend/            capa de datos: tauri.ts (IPC) y http.ts (editor web, API de PuduHub)
+  web/                    entrada y shell del editor web (npm run build:web -> dist-web/)
 src-tauri/
   src/
     lib.rs                comandos IPC + estado de la app
@@ -56,6 +58,7 @@ src-tauri/
   binaries/               sidecars typst-* y pudureport-mcp-* (gitignored, se generan por release)
   tauri.conf.json         config Tauri (CSP, assetProtocol, bundle, sidecar)
 mcp/                      crate pudureport-mcp: servidor MCP por stdio (lee/edita hallazgos)
+service/                  crate pudureport-service: render de paquetes .pudupkg a PDF por HTTP (ver docs/modo-servidor.md)
 templates/                plantillas .typ base (pentest, oscp, htb, ejecutivo, documento-libre, retest)
 scripts/fetch-typst.mjs   baja el sidecar de Typst por plataforma
 scripts/build-mcp-sidecar.mjs  compila el sidecar pudureport-mcp por plataforma
@@ -104,7 +107,7 @@ npm run tauri build    # genera .dmg / .msi / .exe / .AppImage / .deb
 
 - **Una plantilla PDF nueva**: agrega `templates/mi-plantilla.typ`. Debe leer `json("data.json")` y consumir el mismo esquema; asi nunca rompe hallazgos existentes. Aparece sola en el selector.
 - **Una seccion nueva del hallazgo**: edita `FINDING_SECTIONS` en `src/lib/sections.ts` (el cuerpo se sigue guardando como markdown con encabezados `##`).
-- **Un comando IPC nuevo**: implementa la logica en el modulo Rust correspondiente, exponelo con `#[tauri::command]` en `lib.rs`, registralo en `invoke_handler!`, y agrega el wrapper tipado en `src/lib/api.ts`.
+- **Un comando IPC nuevo**: implementa la logica en el modulo Rust correspondiente, exponelo con `#[tauri::command]` en `lib.rs`, registralo en `invoke_handler!`, agrega el metodo a la interfaz `Backend` (`src/lib/backend/types.ts`) y a `tauri.ts` (y en `http.ts`, si aplica al editor web), y el wrapper tipado en `src/lib/api.ts`.
 
 ## Tests
 

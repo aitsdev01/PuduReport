@@ -89,9 +89,10 @@ todos los posibles y su tipo:
 | `impacto_negocio` | string, opcional         | impacto para el negocio en un parrafo de texto plano (hasta 500 caracteres); puede venir vacio |
 | `categoria_riesgo` | string (enum) \| null, opcional | `fuga_datos` `fraude_economico` `interrupcion_servicio` `incumplimiento_regulatorio` `reputacional` `reconocimiento`; `null` si no esta definida |
 | `causa_raiz`   | objeto \| null, opcional     | `{ "clave": string, "titulo": string }` de la causa raiz del proyecto; `null` si el hallazgo no tiene |
+| `uid`          | string                      | id estable del hallazgo (nombre de archivo, ej. `001-sqli-login`). No cambia al editar el titulo. Opcional: no viene activado por defecto |
 
-Los cuatro ultimos (campos de negocio del informe de ethical hacking) **no
-vienen activados por default** ni en destinos nuevos ni en los existentes: un
+Los campos `modulo`, `impacto_negocio`, `categoria_riesgo` y `causa_raiz`
+(campos de negocio del informe de ethical hacking) **no vienen activados por default** ni en destinos nuevos ni en los existentes: un
 receptor que rechaza claves desconocidas sigue recibiendo el mismo payload hasta
 que el usuario los marque en "Campos a enviar". Si el destino los activa, la
 clave viene en todos los hallazgos (esquema estable): `""` para los textos
@@ -109,6 +110,12 @@ Etiquetas legibles de `categoria_riesgo` (las que usa el PDF y el CSV):
 | `incumplimiento_regulatorio` | Incumplimiento regulatorio     |
 | `reputacional`               | Reputacional                   |
 | `reconocimiento`             | Reconocimiento y persistencia  |
+
+Nota sobre `uid`: sirve para reconocer el mismo hallazgo entre exportaciones
+sucesivas del mismo proyecto (por ejemplo, no duplicar una vulnerabilidad al
+corregir el titulo y volver a enviar). Es unico dentro del proyecto, no entre
+proyectos: combinalo con `project.id`. Un hallazgo duplicado en la app recibe un
+`uid` nuevo. Si el destino no lo activa, la clave no aparece.
 
 Nota sobre `cvss`: en tipos de examen (`oscp`, `htb`) la severidad es cualitativa
 y no hay CVSS numerico; en esos casos `cvss` puede llegar como string o `null`.
@@ -231,6 +238,7 @@ interface PuduReportFinding {
   impacto_negocio?: string;
   categoria_riesgo?: RiskCategory | null;
   causa_raiz?: { clave: string; titulo: string } | null;
+  uid?: string; // solo si el destino lo activa
 }
 ```
 
@@ -292,6 +300,7 @@ interface PuduReportExport {
     categoria_riesgo?: "fuga_datos" | "fraude_economico" | "interrupcion_servicio"
       | "incumplimiento_regulatorio" | "reputacional" | "reconocimiento" | null;
     causa_raiz?: { clave: string; titulo: string } | null;
+    uid?: string; // id estable del hallazgo dentro del proyecto (opcional)
   }>;
 }
 ```

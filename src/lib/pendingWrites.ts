@@ -53,3 +53,8 @@ export function scheduleWrite(
 export async function flushWrites(): Promise<void> {
   await Promise.all([...entries].map(([key, entry]) => flushEntry(key, entry)));
 }
+
+/** Hay escrituras programadas o en curso (para avisar antes de cerrar la pagina). */
+export function hasPendingWrites(): boolean {
+  return entries.size > 0;
+}

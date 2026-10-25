@@ -4,7 +4,7 @@ import tsparser from "@typescript-eslint/parser";
 import reactHooks from "eslint-plugin-react-hooks";
 
 export default [
-  { ignores: ["dist", "src-tauri/target", "node_modules"] },
+  { ignores: ["dist", "dist-web", "src-tauri/target", "target", "node_modules"] },
   js.configs.recommended,
   {
     // Scripts de Node (sidecar, utilidades de build).
@@ -18,6 +18,8 @@ export default [
         fetch: "readonly",
         Buffer: "readonly",
         URL: "readonly",
+        URLSearchParams: "readonly",
+        Response: "readonly",
       },
     },
   },
@@ -54,6 +56,17 @@ export default [
         HTMLImageElement: "readonly",
         CanvasRenderingContext2D: "readonly",
         Image: "readonly",
+        // Editor web (capa de datos HTTP).
+        fetch: "readonly",
+        Response: "readonly",
+        RequestInit: "readonly",
+        BodyInit: "readonly",
+        URLSearchParams: "readonly",
+        BeforeUnloadEvent: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        atob: "readonly",
+        URL: "readonly",
       },
     },
     plugins: {

@@ -1,0 +1,31 @@
+[package]
+name = "pudureport-service"
+version = "0.0.25"
+description = "Servicio interno de PuduReport: genera el PDF de un paquete .pudupkg con el mismo motor y plantillas que la app, y calcula CVSS. Sin salida de red."
+license = "GPL-3.0-only"
+edition = "2021"
+rust-version = "1.88"
+
+[[bin]]
+name = "pudureport-service"
+path = "src/main.rs"
+
+[lib]
+name = "pudureport_service"
+path = "src/lib.rs"
+
+[dependencies]
+pudureport-core = { path = "../core" }
+# HTTP minimo: axum sobre hyper/tokio (MIT), sin features que no se usan.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_yaml = "0.9"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+http-body-util = "0.1"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }

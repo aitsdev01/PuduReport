@@ -5,6 +5,7 @@ FEATURE.md
 # Dependencias y builds
 node_modules/
 dist/
+dist-web/
 src-tauri/target/
 src-tauri/gen/
 **/build/

@@ -1,6 +1,7 @@
-# Workspace de Rust: core compartido + app Tauri + binario MCP (stdio).
+# Workspace de Rust: core compartido + app Tauri + binario MCP (stdio) +
+# servicio interno de render (modo servidor).
 [workspace]
-members = ["core", "src-tauri", "mcp"]
+members = ["core", "src-tauri", "mcp", "service"]
 resolver = "2"
 
 # El perfil de release vive en la raiz del workspace (Cargo lo ignora en miembros).
@@ -10,3 +11,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Perfil del servicio (service/Dockerfile): igual que release, pero un panic
+# en una peticion no aborta todo el proceso.
+[profile.release-service]
+inherits = "release"
+panic = "unwind"

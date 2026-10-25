@@ -798,6 +798,23 @@ fn executive_insert_position(layout: &[ReportBlock]) -> usize {
         .unwrap_or(layout.len())
 }
 
+/// Tipos de proyecto conocidos (los mismos de `src/lib/projectTypes.ts`).
+pub const PROJECT_TYPES: [&str; 13] = [
+    "pentest",
+    "redteam",
+    "oscp",
+    "htb",
+    "ejecutivo",
+    "documento",
+    "cti",
+    "incidente",
+    "auditoria",
+    "cumplimiento",
+    "riesgos",
+    "hunting",
+    "retest",
+];
+
 /// Tipo de proyecto por defecto cuando el archivo no lo trae.
 pub fn default_project_type() -> String {
     "pentest".to_string()

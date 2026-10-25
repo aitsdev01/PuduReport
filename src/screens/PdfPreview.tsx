@@ -33,6 +33,9 @@ const CSV_COLUMNS: { key: string; label: string }[] = [
   { key: "impacto_negocio", label: "Impacto al negocio" },
   { key: "categoria_riesgo", label: "Categoria de riesgo" },
   { key: "causa_raiz", label: "Causa raiz" },
+
+  // Id estable del hallazgo (nombre de archivo); no cambia con el titulo.
+  { key: "uid", label: "ID estable (uid)" },
 ];
 const CSV_DEFAULT = ["numero", "titulo", "severidad", "cvss", "estado", "afectados"];
 // Campos por default de un destino de API nuevo (metadata util para KPIs).
@@ -66,9 +69,15 @@ function emptyTarget(): ExportTarget {
 
 export function PdfPreview({ projectId, onPickProject }: Props) {
   const { guard, notify } = useToast();
+  const caps = api.capabilities();
   const [loading, setLoading] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [pdfPath, setPdfPath] = useState<string | null>(null);
+  // En web, el ultimo PDF generado en la sesion (URL de descarga en PuduHub).
+  const [pdfPath, setPdfPath] = useState<string | null>(() =>
+    projectId ? api.lastGeneratedPdf(projectId) : null,
+  );
+  const [generating, setGenerating] = useState(false);
+  const [pkgPath, setPkgPath] = useState<string | null>(null);
   const [execPath, setExecPath] = useState<string | null>(null);
   const [alsoExec, setAlsoExec] = useState(false);
   const [csvOpen, setCsvOpen] = useState(false);
@@ -92,9 +101,10 @@ export function PdfPreview({ projectId, onPickProject }: Props) {
   const [editHasToken, setEditHasToken] = useState(false);
 
   const loadTargets = useCallback(async () => {
+    if (!caps.exportTargets) return;
     const list = await guard(api.listExportTargets());
     if (list) setTargets(list);
-  }, [guard]);
+  }, [guard, caps.exportTargets]);
 
   useEffect(() => {
     loadTargets();
@@ -126,11 +136,41 @@ export function PdfPreview({ projectId, onPickProject }: Props) {
   }, [apiOpen, projectId, selName, targets]);
 
   async function handleExport() {
-    if (!projectId) return;
-    const paths = await guard(api.generatePdf(projectId, alsoExec), "PDF exportado");
+    if (!projectId || generating) return;
+    setGenerating(true);
+    const paths = await guard(
+      api.generatePdf(projectId, caps.localFiles && alsoExec),
+      caps.localFiles ? "PDF exportado" : "PDF generado",
+    );
+    setGenerating(false);
     if (paths) {
       setPdfPath(paths[0] ?? null);
       setExecPath(paths[1] ?? null);
+    }
+  }
+
+  // Web: la descarga es solo para Admin en PuduHub; a un Ingeniero se le
+  // explica (aviso informativo, no error).
+  async function handleDownload(url: string) {
+    if (!projectId) return;
+    try {
+      await api.downloadGeneratedPdf(projectId, url);
+    } catch (error) {
+      const forbidden = (error as { status?: unknown } | null)?.status === 403;
+      notify(String(error), forbidden ? "info" : "error");
+    }
+  }
+
+  async function handleExportPackage() {
+    if (!projectId) return;
+    const result = await guard(api.exportPackage(projectId), "Paquete exportado");
+    if (!result) return;
+    setPkgPath(result.path);
+    if (result.skipped.length > 0) {
+      notify(
+        `Se omitieron ${result.skipped.length} archivos de assets que no son imagenes permitidas.`,
+        "info",
+      );
     }
   }
 
@@ -239,40 +279,72 @@ export function PdfPreview({ projectId, onPickProject }: Props) {
       <div className="screen-head">
         <div>
           <h1>Vista previa PDF</h1>
-          <p className="sub">Se regenera con el contenido actual del proyecto.</p>
+          <p className="sub">
+            {caps.pagePreview
+              ? "Se regenera con el contenido actual del proyecto."
+              : "El PDF se genera en PuduHub con el contenido guardado del informe."}
+          </p>
         </div>
         <div className="row" style={{ gap: 8 }}>
-          <label className="row" style={{ gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
-            <input
-              type="checkbox"
-              checked={alsoExec}
-              onChange={(e) => setAlsoExec(e.target.checked)}
-            />
-            Tambien informe ejecutivo
-          </label>
-          <button className="btn" onClick={() => setRefreshKey((k) => k + 1)} disabled={loading}>
-            <i className={`ti ${loading ? "ti-loader-2" : "ti-refresh"}`} />
-            {loading ? "Generando..." : "Actualizar"}
+          {caps.localFiles && (
+            <label className="row" style={{ gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+              <input
+                type="checkbox"
+                checked={alsoExec}
+                onChange={(e) => setAlsoExec(e.target.checked)}
+              />
+              Tambien informe ejecutivo
+            </label>
+          )}
+          {caps.pagePreview && (
+            <button className="btn" onClick={() => setRefreshKey((k) => k + 1)} disabled={loading}>
+              <i className={`ti ${loading ? "ti-loader-2" : "ti-refresh"}`} />
+              {loading ? "Generando..." : "Actualizar"}
+            </button>
+          )}
+          <button className="btn primary" onClick={handleExport} disabled={generating}>
+            <i className={`ti ${generating ? "ti-loader-2" : "ti-download"}`} />
+            {caps.localFiles
+              ? "Exportar PDF"
+              : generating
+                ? "Generando en PuduHub..."
+                : "Generar PDF"}
           </button>
-          <button className="btn primary" onClick={handleExport}>
-            <i className="ti ti-download" />
-            Exportar PDF
-          </button>
-          <button className="btn" onClick={() => setCsvOpen(true)}>
-            <i className="ti ti-table-export" />
-            Exportar CSV
-          </button>
-          <button className="btn" onClick={openApi}>
-            <i className="ti ti-cloud-upload" />
-            Enviar a API
-          </button>
-          {csvPath && (
+          {caps.csvExport && (
+            <button className="btn" onClick={() => setCsvOpen(true)}>
+              <i className="ti ti-table-export" />
+              Exportar CSV
+            </button>
+          )}
+          {caps.exportTargets && (
+            <button className="btn" onClick={openApi}>
+              <i className="ti ti-cloud-upload" />
+              Enviar a API
+            </button>
+          )}
+          {caps.packages && (
+            <button
+              className="btn"
+              onClick={handleExportPackage}
+              title="Paquete .pudupkg con el proyecto, sus evidencias y la marca"
+            >
+              <i className="ti ti-package-export" />
+              Exportar paquete
+            </button>
+          )}
+          {caps.localFiles && pkgPath && (
+            <button className="btn" onClick={() => guard(api.revealPath(pkgPath))}>
+              <i className="ti ti-package" />
+              Ver paquete
+            </button>
+          )}
+          {caps.localFiles && csvPath && (
             <button className="btn" onClick={() => guard(api.openPath(csvPath))}>
               <i className="ti ti-file-spreadsheet" />
               Abrir CSV
             </button>
           )}
-          {pdfPath && (
+          {caps.localFiles && pdfPath && (
             <>
               <button className="btn" onClick={() => guard(api.openPath(pdfPath))}>
                 <i className="ti ti-file-type-pdf" />
@@ -284,12 +356,18 @@ export function PdfPreview({ projectId, onPickProject }: Props) {
               </button>
             </>
           )}
-          {execPath && (
+          {caps.localFiles && execPath && (
             <button className="btn" onClick={() => guard(api.openPath(execPath))}>
               <i className="ti ti-presentation" />
               Abrir ejecutivo
             </button>
           )}
+          {!caps.localFiles && pdfPath && (
+            <button className="btn" onClick={() => void handleDownload(pdfPath)}>
+              <i className="ti ti-file-type-pdf" />
+              Descargar PDF
+            </button>
+          )}{" "}
         </div>
       </div>
 

@@ -325,16 +325,33 @@ pub fn create_project(
     fs::create_dir_all(dir.join("assets"))?;
     fs::create_dir_all(dir.join("build"))?;
 
-    let meta = ProjectMeta {
+    let meta = new_project_meta(name, client, project_type);
+    write_project_meta(root, &id, &meta)?;
+    Ok((id, meta))
+}
+
+/// `project.yaml` de un proyecto nuevo del tipo indicado, tal como lo crea la
+/// app: secciones del tipo, estado "Por hacer" y el resto por defecto (layout
+/// vacio = el del tipo al leer; sin hallazgos). Puro: no toca el disco.
+pub fn new_project_meta(name: &str, client: &str, project_type: &str) -> ProjectMeta {
+    ProjectMeta {
         name: name.to_string(),
         client: client.to_string(),
         project_type: project_type.to_string(),
         sections: sections_for_type(project_type),
         project_status: ProjectStatus::Todo,
         ..Default::default()
-    };
-    write_project_meta(root, &id, &meta)?;
-    Ok((id, meta))
+    }
+}
+
+/// Texto de `project.yaml` de un proyecto nuevo, ya normalizado como lo lee la
+/// app (layout por defecto del tipo explicito). Lo usa el servicio para que
+/// otro sistema cree informes con la misma estructura que el escritorio.
+pub fn initial_project_yaml(name: &str, client: &str, project_type: &str) -> Result<String> {
+    let mut meta = new_project_meta(name, client, project_type);
+    meta.reconcile_layout();
+    meta.normalize_classification();
+    Ok(serde_yaml::to_string(&meta)?)
 }
 
 /// Borra un proyecto completo (su carpeta y todo su contenido) del workspace.
@@ -872,6 +889,26 @@ fn parse_finding_file(path: &Path) -> Result<Finding> {
     Ok(Finding { id, meta, body })
 }
 
+/// Parsea el contenido de un archivo de hallazgo (front-matter YAML + cuerpo)
+/// con el mismo parser que la lectura desde disco. Lo usa el paquete
+/// `.pudupkg` para validar hallazgos antes de escribirlos.
+pub fn parse_finding_document(id: &str, content: &str) -> Result<Finding> {
+    validate_id(id)?;
+    let (yaml, body) = split_front_matter(content, id)?;
+    let meta: FindingMeta = serde_yaml::from_str(&yaml)?;
+    Ok(Finding {
+        id: id.to_string(),
+        meta,
+        body,
+    })
+}
+
+/// Id de carpeta libre para un proyecto nuevo a partir de un nombre base
+/// (slug), agregando un sufijo numerico si ya existe.
+pub fn unique_project_id(root: &Path, base: &str) -> String {
+    unique_dir(root, &slugify(base))
+}
+
 /// Lista los hallazgos de un proyecto, respetando el orden de project.yaml.
 pub fn list_findings(root: &Path, project_id: &str) -> Result<Vec<Finding>> {
     validate_id(project_id)?;
@@ -1374,6 +1411,28 @@ mod tests {
             title
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_project_yaml_matches_created_project() {
+        let tmp = std::env::temp_dir().join(format!("pudu-inicial-{}", uuid::Uuid::new_v4()));
+        create_workspace(&tmp, "WS").unwrap();
+        for project_type in crate::models::PROJECT_TYPES {
+            let yaml = initial_project_yaml("Informe", "ACME", project_type).unwrap();
+            let parsed: ProjectMeta = serde_yaml::from_str(&yaml).unwrap();
+            // Igual a lo que la app lee tras crear el proyecto en disco.
+            let (id, _) = create_project(&tmp, "Informe", "ACME", project_type).unwrap();
+            let created = read_project_meta(&tmp, &id).unwrap();
+            assert_eq!(
+                serde_yaml::to_string(&parsed).unwrap(),
+                serde_yaml::to_string(&created).unwrap(),
+                "{project_type}"
+            );
+            assert!(!parsed.layout.is_empty(), "{project_type} sin layout");
+            assert!(parsed.finding_order.is_empty());
+            assert_eq!(parsed.project_type, project_type);
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -14,4 +14,5 @@ pub mod sections;
 pub mod workspace;
 
 pub mod naming;
+pub mod package;
 pub mod pdf;

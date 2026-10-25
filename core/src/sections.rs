@@ -114,11 +114,11 @@ pub fn update_section(body: &str, key: &str, content: &str) -> Result<String, St
         return Err("cierre el bloque de codigo del contenido antes de guardar".into());
     }
     let mut spans = headings(body);
-    if spans.first().map_or(true, |(offset, _)| *offset > 0) && !body.trim().is_empty() {
+    if spans.first().is_none_or(|(offset, _)| *offset > 0) && !body.trim().is_empty() {
         // El preambulo pertenece a Descripcion, igual que en la UI.
         if spans
             .first()
-            .map_or(true, |(offset, _)| !body[..*offset].trim().is_empty())
+            .is_none_or(|(offset, _)| !body[..*offset].trim().is_empty())
         {
             spans.insert(0, (0, "descripcion"));
         }

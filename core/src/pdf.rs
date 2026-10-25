@@ -8,8 +8,10 @@
 //! `build/data.json`, copia la plantilla activa a `build/report.typ` y compila
 //! con Typst. Cualquier plantilla consume el mismo `data.json`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -39,6 +41,8 @@ pub enum PdfError {
     Compile(String),
     #[error("no se encontro el binario de Typst")]
     TypstNotFound,
+    #[error("la generacion del PDF supero el tiempo limite de {0} s")]
+    Timeout(u64),
 }
 
 type Result<T> = std::result::Result<T, PdfError>;
@@ -519,13 +523,16 @@ fn prepare_build(
     Ok((build_dir, report_typ))
 }
 
-/// Ejecuta `typst compile` mapeando el error de binario ausente.
+/// Ejecuta `typst compile` mapeando el error de binario ausente. Con
+/// `timeout`, mata el proceso si no termina a tiempo (lo usa el servicio; la
+/// app de escritorio no pone limite).
 fn run_typst(
     typst_bin: &Path,
     root: &Path,
     report_typ: &Path,
     out: &Path,
     ppi: Option<u32>,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let mut cmd = Command::new(typst_bin);
     // En Windows, spawnear el sidecar abre una consola que parpadea en cada
@@ -542,15 +549,52 @@ fn run_typst(
             .arg("--ppi")
             .arg(ppi.to_string());
     }
-    let output = cmd.arg(report_typ).arg(out).output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            PdfError::TypstNotFound
-        } else {
-            PdfError::Io(e)
+    let mut child = cmd
+        .arg(report_typ)
+        .arg(out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                PdfError::TypstNotFound
+            } else {
+                PdfError::Io(e)
+            }
+        })?;
+    // stderr se lee en otro hilo para que el proceso no se bloquee si llena
+    // el pipe; acotado a 1 MiB.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = stderr {
+            let _ = pipe.take(1024 * 1024).read_to_string(&mut text);
         }
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        text
+    });
+    let status = match timeout {
+        None => child.wait()?,
+        Some(limit) => {
+            let deadline = Instant::now() + limit;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // El hilo lector no se espera: termina solo cuando se
+                    // cierra el pipe (ya sin proceso que lo bloquee).
+                    drop(reader);
+                    return Err(PdfError::Timeout(limit.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    let stderr = reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(PdfError::Compile(compile_error_summary(&stderr)));
     }
     Ok(())
@@ -617,7 +661,7 @@ pub fn generate_pdf(
     let template = effective_template(&project);
     let (build_dir, report_typ) = prepare_build(root, project_id, templates_dir, &template)?;
     let primary = build_dir.join(report_filename(&project));
-    run_typst(typst_bin, root, &report_typ, &primary, None)?;
+    run_typst(typst_bin, root, &report_typ, &primary, None, None)?;
     let mut out = vec![primary];
 
     if also_executive && template != "ejecutivo" {
@@ -629,10 +673,63 @@ pub fn generate_pdf(
             "{}-ejecutivo.pdf",
             naming::standard_basename(&project)
         ));
-        run_typst(typst_bin, root, &exec_typ, &exec_pdf, None)?;
+        run_typst(typst_bin, root, &exec_typ, &exec_pdf, None, None)?;
         out.push(exec_pdf);
     }
     Ok(out)
+}
+
+/// Plantillas base incluidas en el binario: (nombre de archivo, fuente).
+/// Son las mismas de `templates/` que empaqueta la app de escritorio.
+pub const BUNDLED_TEMPLATES: &[(&str, &str)] = &[
+    ("pentest.typ", include_str!("../../templates/pentest.typ")),
+    ("oscp.typ", include_str!("../../templates/oscp.typ")),
+    ("htb.typ", include_str!("../../templates/htb.typ")),
+    (
+        "ejecutivo.typ",
+        include_str!("../../templates/ejecutivo.typ"),
+    ),
+    (
+        "documento-libre.typ",
+        include_str!("../../templates/documento-libre.typ"),
+    ),
+    ("retest.typ", include_str!("../../templates/retest.typ")),
+    ("cti.typ", include_str!("../../templates/cti.typ")),
+    (
+        "incidente.typ",
+        include_str!("../../templates/incidente.typ"),
+    ),
+    ("theme.typ", include_str!("../../templates/theme.typ")),
+    (
+        "code-dark.tmTheme",
+        include_str!("../../templates/code-dark.tmTheme"),
+    ),
+];
+
+/// Nombres (sin extension) de las plantillas de reporte incluidas; excluye
+/// la libreria de diseno compartida `theme`.
+pub fn bundled_template_names() -> Vec<&'static str> {
+    BUNDLED_TEMPLATES
+        .iter()
+        .filter_map(|(file, _)| file.strip_suffix(".typ"))
+        .filter(|name| *name != "theme")
+        .collect()
+}
+
+/// Escribe las plantillas incluidas en un directorio temporal unico, ejecuta
+/// `f` con esa ruta y lo borra al terminar.
+fn with_bundled_templates<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    let templates = std::env::temp_dir().join(format!("pudu-templates-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&templates)?;
+    let result = (|| {
+        for (name, source) in BUNDLED_TEMPLATES {
+            std::fs::write(templates.join(name), source)?;
+        }
+        f(&templates)
+    })();
+    // Solo borra el directorio temporal unico creado por esta llamada.
+    let _ = std::fs::remove_dir_all(&templates);
+    result
 }
 
 /// Compila con las mismas plantillas base incluidas, sin depender de Tauri.
@@ -643,40 +740,51 @@ pub fn generate_pdf_bundled(
     typst_bin: &Path,
 ) -> Result<Vec<PathBuf>> {
     workspace::read_project_meta(root, project_id)?;
-    let templates = std::env::temp_dir().join(format!("pudu-templates-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&templates)?;
-    let result = (|| {
-        for (name, source) in [
-            ("pentest.typ", include_str!("../../templates/pentest.typ")),
-            ("oscp.typ", include_str!("../../templates/oscp.typ")),
-            ("htb.typ", include_str!("../../templates/htb.typ")),
-            (
-                "ejecutivo.typ",
-                include_str!("../../templates/ejecutivo.typ"),
-            ),
-            (
-                "documento-libre.typ",
-                include_str!("../../templates/documento-libre.typ"),
-            ),
-            ("retest.typ", include_str!("../../templates/retest.typ")),
-            ("cti.typ", include_str!("../../templates/cti.typ")),
-            (
-                "incidente.typ",
-                include_str!("../../templates/incidente.typ"),
-            ),
-            ("theme.typ", include_str!("../../templates/theme.typ")),
-            (
-                "code-dark.tmTheme",
-                include_str!("../../templates/code-dark.tmTheme"),
-            ),
-        ] {
-            std::fs::write(templates.join(name), source)?;
-        }
-        generate_pdf(root, project_id, &templates, typst_bin, false)
-    })();
-    // Solo borra el directorio temporal unico creado por esta llamada.
-    let _ = std::fs::remove_dir_all(&templates);
-    result
+    with_bundled_templates(|templates| generate_pdf(root, project_id, templates, typst_bin, false))
+}
+
+/// Opciones de un render con las plantillas incluidas (modo servicio).
+#[derive(Debug, Clone, Default)]
+pub struct RenderOptions {
+    /// Plantilla a usar en lugar de la efectiva del proyecto. Solo se aceptan
+    /// nombres de `bundled_template_names()`.
+    pub template: Option<String>,
+    /// Tiempo maximo de Typst; al vencer se mata el proceso.
+    pub timeout: Option<Duration>,
+}
+
+/// PDF generado por `render_bundled`.
+#[derive(Debug, Clone)]
+pub struct RenderedPdf {
+    /// Ruta del PDF dentro de `<proyecto>/build/`.
+    pub path: PathBuf,
+    /// Plantilla usada (sin extension).
+    pub template: String,
+}
+
+/// Genera el PDF principal con las plantillas incluidas, con plantilla
+/// opcional y limite de tiempo. Lo usa `pudureport-service`.
+pub fn render_bundled(
+    root: &Path,
+    project_id: &str,
+    typst_bin: &Path,
+    options: &RenderOptions,
+) -> Result<RenderedPdf> {
+    let project = workspace::read_project_meta(root, project_id)?;
+    let template = match options.template.as_deref().filter(|t| !t.is_empty()) {
+        Some(name) if bundled_template_names().contains(&name) => name.to_string(),
+        Some(name) => return Err(PdfError::TemplateNotFound(name.to_string())),
+        None => effective_template(&project),
+    };
+    with_bundled_templates(|templates| {
+        let (build_dir, report_typ) = prepare_build(root, project_id, templates, &template)?;
+        let path = build_dir.join(report_filename(&project));
+        run_typst(typst_bin, root, &report_typ, &path, None, options.timeout)?;
+        Ok(RenderedPdf {
+            path,
+            template: template.clone(),
+        })
+    })
 }
 
 /// Renderiza el PDF a PNG por pagina y los devuelve como data URLs base64,
@@ -705,7 +813,7 @@ pub fn preview_pdf(
 
     // Typst sustituye {p} por el numero de pagina (1-based).
     let pattern = preview_dir.join("page-{0p}.png");
-    run_typst(typst_bin, root, &report_typ, &pattern, Some(120))?;
+    run_typst(typst_bin, root, &report_typ, &pattern, Some(120), None)?;
 
     // Recolectar las paginas en orden.
     let mut pages: Vec<PathBuf> = std::fs::read_dir(&preview_dir)?
@@ -918,6 +1026,51 @@ mod tests {
     fn compile_error_summary_keeps_stderr_without_error_line() {
         let stderr = "warning: unknown font family: helvetica neue\n";
         assert_eq!(compile_error_summary(stderr), stderr);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_typst_kills_process_after_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Un "typst" falso que nunca termina a tiempo.
+        let dir = std::env::temp_dir().join(format!("pudu-typst-lento-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("typst");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let err = run_typst(
+            &fake,
+            &dir,
+            &dir.join("report.typ"),
+            &dir.join("out.pdf"),
+            None,
+            Some(Duration::from_millis(300)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PdfError::Timeout(_)), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_bundled_rejects_unknown_template() {
+        let tmp = std::env::temp_dir().join(format!("pudu-pdf-tpl-{}", uuid::Uuid::new_v4()));
+        workspace::create_workspace(&tmp, "WS").unwrap();
+        let (pid, _) = workspace::create_project(&tmp, "Web", "ACME", "pentest").unwrap();
+        for bad in ["../pentest", "theme", "no-existe"] {
+            let options = RenderOptions {
+                template: Some(bad.to_string()),
+                timeout: None,
+            };
+            let err = render_bundled(&tmp, &pid, Path::new("typst"), &options).unwrap_err();
+            assert!(matches!(err, PdfError::TemplateNotFound(_)), "{bad}: {err}");
+        }
+        assert!(bundled_template_names().contains(&"pentest"));
+        assert!(!bundled_template_names().contains(&"theme"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Devuelve true si hay un binario de Typst ejecutable disponible.

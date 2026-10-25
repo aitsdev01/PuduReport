@@ -35,4 +35,5 @@ exceptions = [
     { name = "pudureport", allow = ["GPL-3.0-only"] },
     { name = "pudureport-core", allow = ["GPL-3.0-only"] },
     { name = "pudureport-mcp", allow = ["GPL-3.0-only"] },
+    { name = "pudureport-service", allow = ["GPL-3.0-only"] },
 ]

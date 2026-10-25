@@ -4,9 +4,14 @@ version = "0.0.25"
 description = "Logica compartida de PuduReport: modelo de datos, CVSS, workspace y markdown"
 license = "GPL-3.0-only"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 
 [dependencies]
+# Paquete .pudupkg (zip + manifest con SHA-256). Solo deflate con backend en
+# Rust puro (miniz_oxide): sin dependencias nativas ni otros compresores.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

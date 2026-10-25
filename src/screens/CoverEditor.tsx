@@ -2,7 +2,6 @@
 // Copyright (c) 2026 bc0d3
 
 import { useCallback, useRef } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import * as api from "../lib/api";
 import type { WorkspaceMeta } from "../lib/types";
 import { BODY_FONT_SUGGESTIONS, MONO_FONT_SUGGESTIONS } from "../lib/fonts";
@@ -43,11 +42,7 @@ function readBase64(file: File): Promise<string> {
 /** Resuelve una ruta de branding (root-relative) a una URL cargable por la webview. */
 function resolveBrandingSrc(path: string, workspacePath: string | null): string {
   if (!path || !workspacePath) return "";
-  try {
-    return convertFileSrc(`${workspacePath}${path}`);
-  } catch {
-    return "";
-  }
+  return api.brandingAssetUrl(path);
 }
 
 export function CoverEditor({ workspace, workspacePath, onWorkspaceSaved }: Props) {

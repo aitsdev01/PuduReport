@@ -26,7 +26,6 @@ import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
 import { Markdown } from "tiptap-markdown";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import * as api from "../lib/api";
 import { PromptDialog } from "./PromptDialog";
 import { ImageAnnotator } from "./ImageAnnotator";
@@ -71,20 +70,18 @@ interface Props {
   value: string;
   onChange: (markdown: string) => void;
   placeholder?: string;
-  /** Directorio absoluto del proyecto; habilita pegar/soltar evidencias. */
+  /** Base de evidencias del proyecto (carpeta local o informe remoto); habilita
+   * pegar/soltar evidencias. */
   assetBase?: string | null;
   /** Id del proyecto, requerido para guardar assets. */
   projectId?: string | null;
 }
 
-/** Resuelve una ruta relativa de asset a una URL cargable por la webview. */
-function resolveSrc(src: string, base?: string | null): string {
-  if (!base || !src || /^(data:|https?:|asset:|blob:)/.test(src)) return src;
-  try {
-    return convertFileSrc(`${base}/${src}`);
-  } catch {
-    return src;
-  }
+/** Resuelve una ruta relativa de asset a una URL cargable (la capa de datos
+ * decide: protocolo asset en escritorio, API del informe en web). */
+function resolveSrc(src: string, base?: string | null, projectId?: string | null): string {
+  if (!base || !projectId || !src || /^(data:|https?:|asset:|blob:)/.test(src)) return src;
+  return api.assetUrl(projectId, src);
 }
 
 /** Interpreta el alt como un ancho ("60%" o "60") y devuelve "NN%" o null. */
@@ -250,7 +247,10 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
     renderHTML({ HTMLAttributes }) {
       const rel = String(HTMLAttributes.src ?? "");
       const width = parseWidth(String(HTMLAttributes.alt ?? ""));
-      const attrs: Record<string, string> = { ...HTMLAttributes, src: resolveSrc(rel, assetBase) };
+      const attrs: Record<string, string> = {
+        ...HTMLAttributes,
+        src: resolveSrc(rel, assetBase, projectId),
+      };
       if (width) attrs.style = `width:${width}`;
       return ["img", attrs];
     },
@@ -369,7 +369,7 @@ export function MarkdownEditor({ value, onChange, placeholder, assetBase, projec
       )}
       {annotateRel && (
         <ImageAnnotator
-          src={resolveSrc(annotateRel, assetBase)}
+          src={resolveSrc(annotateRel, assetBase, projectId)}
           onCancel={() => setAnnotateRel(null)}
           onConfirm={(dataUrl) => void handleAnnotateConfirm(dataUrl)}
         />

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 bc0d3
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "./lib/api";
 import type { PdfTemplate, ProjectMeta, ProjectSummary, WorkspaceMeta } from "./lib/types";
 import { familyForProject, usesFreeMarkdown } from "./lib/projectTypes";
@@ -80,16 +79,10 @@ function AppInner() {
     window.localStorage.setItem("pudu-theme", dark ? "dark" : "light");
   }, [dark]);
 
-  // Titulo de la ventana nativa con el nombre del workspace.
+  // Titulo de la ventana nativa con el nombre del workspace (la capa de datos
+  // lo ignora fuera de Tauri).
   useEffect(() => {
-    try {
-      const title = workspace ? `PuduReport — ${workspace.name}` : "PuduReport";
-      getCurrentWindow()
-        .setTitle(title)
-        .catch(() => {});
-    } catch {
-      // Fuera de Tauri (preview en navegador): ignorar.
-    }
+    api.setWindowTitle(workspace ? `PuduReport — ${workspace.name}` : "PuduReport");
   }, [workspace]);
 
   const loadProjects = useCallback(async () => {

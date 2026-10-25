@@ -34,6 +34,8 @@ fn header_for(col: &str) -> &str {
         "impacto_negocio" => "Impacto al negocio",
         "categoria_riesgo" => "Categoria de riesgo",
         "causa_raiz" => "Causa raiz",
+
+        "uid" => "ID estable",
         other => other,
     }
 }
@@ -122,6 +124,8 @@ fn value_for(col: &str, n: usize, f: &Finding, project: &ProjectMeta) -> String 
         "impacto_negocio" => f.meta.impacto_negocio.trim().to_string(),
         "categoria_riesgo" => categoria_riesgo_label(&f.meta.categoria_riesgo).to_string(),
         "causa_raiz" => root_cause_title(f, project).to_string(),
+
+        "uid" => f.id.clone(),
         _ => String::new(),
     }
 }
@@ -227,6 +231,11 @@ fn json_value_for(col: &str, n: usize, f: &Finding, project: &ProjectMeta) -> Va
             "clave": f.meta.causa_raiz,
             "titulo": root_cause_title(f, project),
         }),
+
+        // Id estable del hallazgo (nombre de archivo sin extension). No cambia
+        // al editar el titulo: permite al receptor reconocer el mismo
+        // hallazgo entre exportaciones sucesivas.
+        "uid" => json!(f.id),
         _ => Value::Null,
     }
 }
@@ -738,6 +747,35 @@ mod tests {
         let payload = build_api_payload(&root, &pid, &target).unwrap();
         assert_eq!(payload["project"]["environment"], "produccion");
         assert!(payload["project"].get("exposure").is_none());
+    }
+
+    #[test]
+    fn payload_uid_es_opcional_y_estable() {
+        let root = tmp_ws();
+        let (pid, _) = workspace::create_project(&root, "Web", "ACME", "pentest").unwrap();
+        workspace::write_finding(
+            &root,
+            &pid,
+            &finding("001-sqli-login", "SQLi", Severity::Critical, "9.8", false),
+        )
+        .unwrap();
+
+        // Sin pedirlo, no sale.
+        let target = target_with_project_fields(&[]);
+        let payload = build_api_payload(&root, &pid, &target).unwrap();
+        assert!(payload["findings"][0].get("uid").is_none());
+
+        // Pedido: es el nombre de archivo y no depende del titulo.
+        let mut target = target_with_project_fields(&[]);
+        target.fields.push("uid".to_string());
+        let payload = build_api_payload(&root, &pid, &target).unwrap();
+        assert_eq!(payload["findings"][0]["uid"], "001-sqli-login");
+
+        let mut f = workspace::load_finding(&root, &pid, "001-sqli-login").unwrap();
+        f.meta.title = "Inyeccion SQL corregida".to_string();
+        workspace::write_finding(&root, &pid, &f).unwrap();
+        let payload = build_api_payload(&root, &pid, &target).unwrap();
+        assert_eq!(payload["findings"][0]["uid"], "001-sqli-login");
     }
 
     #[test]

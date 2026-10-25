@@ -925,6 +925,100 @@ async fn preview_pdf(app: AppHandle, project_id: String) -> Result<Vec<String>, 
     .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Paquete .pudupkg (mover un proyecto entre equipos o hacia un servicio)
+// ---------------------------------------------------------------------------
+
+/// Resultado de exportar un paquete para el frontend.
+#[derive(serde::Serialize)]
+struct PackageExport {
+    /// Ruta del `.pudupkg` escrito en `build/`.
+    path: String,
+    /// Archivos de `assets/` omitidos por no ser imagenes permitidas.
+    skipped: Vec<String>,
+}
+
+/// Exporta el proyecto a `build/{Cliente}-{Tipo}-{fecha}.pudupkg`, con la marca
+/// del workspace para que se vea igual en otro equipo.
+#[tauri::command]
+fn export_package(state: State<AppState>, project_id: String) -> Result<PackageExport, String> {
+    use pudureport_core::package;
+    let root = current_root(&state)?;
+    let project = workspace::read_project_meta(&root, &project_id).map_err(|e| e.to_string())?;
+    let exported =
+        package::export_package(&root, &project_id, &package::PackageInfo::default(), true)
+            .map_err(|e| e.to_string())?;
+    let build_dir = root.join(&project_id).join("build");
+    std::fs::create_dir_all(&build_dir).map_err(|e| e.to_string())?;
+    let path = build_dir.join(format!(
+        "{}.{}",
+        naming::standard_basename(&project),
+        package::EXTENSION
+    ));
+    std::fs::write(&path, &exported.bytes).map_err(|e| e.to_string())?;
+    Ok(PackageExport {
+        path: path.to_string_lossy().to_string(),
+        skipped: exported.skipped,
+    })
+}
+
+/// Pide un `.pudupkg` y lo importa como proyecto nuevo (nunca pisa uno
+/// existente ni la marca del workspace). Devuelve None si se cancela.
+#[tauri::command]
+async fn import_package(app: AppHandle) -> Result<Option<ProjectSummary>, String> {
+    use pudureport_core::package;
+    let root = {
+        let state = app.state::<AppState>();
+        current_root(&state)?
+    };
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Paquete PuduReport", &[package::EXTENSION])
+        .blocking_pick_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let limits = package::PackageLimits::default();
+    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if size > limits.max_package_bytes {
+        return Err(format!(
+            "el paquete supera el limite de {} MiB",
+            limits.max_package_bytes / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let imported = tauri::async_runtime::spawn_blocking(move || {
+        package::import_package(
+            &root,
+            &bytes,
+            &package::ImportOptions {
+                limits,
+                ..Default::default()
+            },
+        )
+        .map(|imported| (root, imported))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let (root, imported) = imported;
+    let _ = db::reindex(&root);
+    let meta = imported.meta;
+    Ok(Some(ProjectSummary {
+        id: imported.project_id,
+        name: meta.name,
+        client: meta.client,
+        project_type: meta.project_type,
+        start_date: meta.start_date,
+        end_date: meta.end_date,
+        finding_count: imported.findings,
+        project_status: meta.project_status,
+        assignment_history: meta.assignment_history,
+    }))
+}
+
 /// Abre un archivo con la aplicacion por defecto del sistema (ej. el PDF).
 /// Solo se permiten rutas dentro del workspace abierto.
 #[tauri::command]
@@ -1065,6 +1159,8 @@ pub fn run() {
             delete_template,
             generate_pdf,
             preview_pdf,
+            export_package,
+            import_package,
             open_path,
             reveal_path,
             git_init,
