@@ -277,6 +277,7 @@ function WebInner({ backend }: Props) {
                 assetBase={projectId}
                 projectType={project?.project_type}
                 family={family}
+                rootCauses={project?.causas_raiz}
                 onGoToPreview={() => void navigate("preview")}
                 onPickProject={() => undefined}
               />

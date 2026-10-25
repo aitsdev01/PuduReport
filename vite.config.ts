@@ -7,10 +7,11 @@ const host = process.env.TAURI_DEV_HOST;
 
 // Editor web (modo servidor, `vite build --mode web`): otra entrada sin Tauri,
 // salida en dist-web/ y base configurable con PUDU_WEB_BASE (por defecto
-// /editor/). CSP sin eval: imagenes, fuentes y API solo del mismo origen.
+// /editor/). CSP sin eval: imagenes y API solo del mismo origen; las fuentes
+// pequenas que Vite incrusta como data: tambien se permiten.
 const WEB_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-  "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; " +
+  "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; " +
   "object-src 'none'; base-uri 'self'; form-action 'self'";
 
 function webBase(): string {
